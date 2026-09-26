@@ -1,0 +1,82 @@
+#!/usr/bin/env bash
+
+# Turn a verified out/<system>/ bundle into release assets.
+
+set -euo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage: package --system SYS [--root DIR] --out DIR
+
+Writes the release assets for one system into --out:
+  <tool>-<system>             one per regular file in bin/
+  SHA256SUMS-<system>         the bundle manifest (paths are bin/<tool>)
+  BUILDINFO-<system>          build provenance
+  static-bins-<system>.tar.gz bin/ (with alias symlinks), SHA256SUMS, BUILDINFO
+
+Options:
+  --system SYS  x86_64-linux or aarch64-linux.
+  --root DIR    Bundle root holding <system>/ (default: <repo>/out).
+  --out DIR     Output directory; created if missing.
+  -h, --help    Show this help.
+
+Run verify first; this script only re-checks the manifest.
+EOF_USAGE
+}
+
+system=
+root="$SCRIPT_DIR/out"
+out=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --system)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      system="$("$SCRIPT_DIR/resolve-system" "$2")"
+      shift 2
+      ;;
+    --root)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      root=$2
+      shift 2
+      ;;
+    --out)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      out=$2
+      shift 2
+      ;;
+    *)
+      printf 'package: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ -z "$system" || -z "$out" ]]; then
+  printf 'package: --system and --out are required\n' >&2
+  usage >&2
+  exit 2
+fi
+
+bundle="$root/$system"
+(cd "$bundle" && sha256sum --check --strict --quiet SHA256SUMS)
+mkdir -p "$out"
+
+while read -r _hash path; do
+  install -m 0755 "$bundle/$path" "$out/${path#bin/}-$system"
+done <"$bundle/SHA256SUMS"
+install -m 0644 "$bundle/SHA256SUMS" "$out/SHA256SUMS-$system"
+install -m 0644 "$bundle/BUILDINFO" "$out/BUILDINFO-$system"
+
+# Normalised metadata so the tarball depends only on the bundle contents.
+tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+  -C "$bundle" -cf - bin SHA256SUMS BUILDINFO \
+  | gzip -9n >"$out/static-bins-$system.tar.gz"
+
+printf 'package: wrote %s assets to %s\n' "$system" "$out"

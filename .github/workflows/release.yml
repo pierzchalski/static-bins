@@ -1,0 +1,124 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  # Standard GitHub-hosted runners have 4 vCPUs and 16 GB of RAM.
+  STATIC_BINS_MAX_JOBS: "4"
+  STATIC_BINS_CORES: "2"
+  STATIC_BINS_ARTIFACT_JOBS: "2"
+
+jobs:
+  # Pull requests build one Nix tool for one target, not the whole bundle.
+  smoke:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - name: Check script usage
+        run: |
+          ./rebuild --help >/dev/null
+          ./verify --help >/dev/null
+          ./resolve-system --help >/dev/null
+          ./install.sh --help >/dev/null
+      - name: Build bwrap (x86_64-linux, partial)
+        run: ./rebuild --tool bwrap --system x86_64-linux --partial
+      - name: Run it
+        run: ./out/x86_64-linux/bin/bwrap --version
+
+  build:
+    if: github.event_name != 'pull_request'
+    strategy:
+      fail-fast: false
+      matrix:
+        # Both targets are built on x86_64 hosts: aarch64 is cross-compiled,
+        # which keeps the derivations identical to a local x86_64 build.
+        system: [x86_64-linux, aarch64-linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Free disk space
+        run: |
+          df -h /
+          sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc \
+            /opt/hostedtoolcache/CodeQL /usr/local/share/boost
+          df -h /
+      - uses: actions/checkout@v7
+      - uses: DeterminateSystems/nix-installer-action@v23
+      - uses: DeterminateSystems/magic-nix-cache-action@v15
+      - name: Rebuild ${{ matrix.system }}
+        run: |
+          start=$(date +%s)
+          ./rebuild --tool all --system "${{ matrix.system }}"
+          echo "rebuild took $(( $(date +%s) - start ))s"
+      - name: Verify
+        run: |
+          if [[ "${{ matrix.system }}" == x86_64-linux ]]; then
+            ./verify --system x86_64-linux
+          else
+            ./verify --system "${{ matrix.system }}" --allow-cross
+          fi
+      - name: Package
+        run: ./package --system "${{ matrix.system }}" --out dist
+      - uses: actions/upload-artifact@v7
+        with:
+          name: static-bins-${{ matrix.system }}
+          path: dist/
+          if-no-files-found: error
+
+  # Runtime smoke tests for the cross-built aarch64 bundle on a native runner.
+  verify-aarch64:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/download-artifact@v8
+        with:
+          name: static-bins-aarch64-linux
+          path: dist
+      - name: Verify natively
+        run: |
+          mkdir -p out/aarch64-linux
+          tar -xzf dist/static-bins-aarch64-linux.tar.gz -C out/aarch64-linux
+          ./verify --system aarch64-linux
+
+  release:
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [build, verify-aarch64]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: dist
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          ls -l dist
+          {
+            printf 'Built by workflow run %s from %s.\n\n' \
+              "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+              "${{ github.sha }}"
+            for manifest in dist/SHA256SUMS-*; do
+              printf '### %s\n\n```\n' "${manifest#dist/}"
+              cat "$manifest"
+              printf '```\n\n'
+            done
+          } > notes.md
+          gh release create "$TAG" dist/* --repo "${{ github.repository }}" \
+            --title "$TAG" --notes-file notes.md
