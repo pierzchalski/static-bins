@@ -24,7 +24,11 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
+      # GitHub Actions cache only; FlakeHub Cache needs an account and token.
       - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - name: Check script usage
         run: |
           ./rebuild --help >/dev/null
@@ -55,7 +59,11 @@ jobs:
           df -h /
       - uses: actions/checkout@v7
       - uses: DeterminateSystems/nix-installer-action@v23
+      # GitHub Actions cache only; FlakeHub Cache needs an account and token.
       - uses: DeterminateSystems/magic-nix-cache-action@v15
+        with:
+          use-flakehub: false
+          use-gha-cache: true
       - name: Rebuild ${{ matrix.system }}
         run: |
           start=$(date +%s)
