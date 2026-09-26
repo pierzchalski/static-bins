@@ -1,0 +1,263 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
+REPO_ROOT=$SCRIPT_DIR
+RESOLVE_SYSTEM="$SCRIPT_DIR/resolve-system"
+STATIC_ROOT="$REPO_ROOT/out"
+
+usage() {
+  cat <<'EOF'
+Usage: verify [--system x86_64-linux|aarch64-linux|all] [--root DIR]
+              [--allow-cross] [--structural-only]
+
+Checks a bundle at DIR/<system>/ (DIR defaults to <repo>/out): BUILDINFO
+provenance against this checkout, file-set parity, checksums, ELF
+architecture/static linkage, and alias containment. Runtime smoke tests run
+for the native architecture.
+
+Options:
+  --system SYS       System to check (default: all).
+  --root DIR         Bundle root (default: <repo>/out).
+  --allow-cross      Accept a single non-native target (structural checks only).
+  --structural-only  Skip execution even for the native architecture.
+  -h, --help         Show this help.
+EOF
+}
+
+requested=all
+allow_cross=0
+structural_only=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --system)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      if [[ "$2" == all ]]; then
+        requested=all
+      else
+        requested="$("$RESOLVE_SYSTEM" "$2")"
+      fi
+      shift 2
+      ;;
+    --root)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      STATIC_ROOT=$2
+      shift 2
+      ;;
+    --allow-cross) allow_cross=1; shift ;;
+    --structural-only) structural_only=1; shift ;;
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    *)
+      printf 'verify: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+
+native_system="$("$RESOLVE_SYSTEM")"
+if [[ "$requested" != all && "$requested" != "$native_system" && $allow_cross -ne 1 ]]; then
+  printf 'verify: %s binaries cannot run on %s (pass --allow-cross for structural checks only)\n' \
+    "$requested" "$native_system" >&2
+  exit 1
+fi
+
+declare -ar REQUIRED_FILES=(
+  atuin
+  bwrap
+  caddy
+  claude-code-proxy
+  dwarfs-universal
+  fuse-overlayfs
+  ip
+  nix-static
+  pandoc
+  passt
+  rclone
+  socat
+  sops
+  ss
+  xtables-nft-multi
+)
+# Source pins BUILDINFO must carry, one per built tool (see rebuild).
+declare -ar REQUIRED_PINS=(
+  pin.claude-code-proxy.commit
+  pin.claude-code-proxy.lock_sha256
+  pin.rclone.sha256
+  pin.pandoc.sha256
+  pin.dwarfs.sha256
+  pin.atuin.sha256
+  pin.bwrap.nix_out
+  pin.fuse-overlayfs.nix_out
+  pin.passt.nix_out
+  pin.iptables.nix_out
+  pin.iproute2.nix_out
+  pin.nix.nix_out
+  pin.caddy.nix_out
+  pin.sops.nix_out
+  pin.socat.nix_out
+)
+declare -ar REQUIRED_LINKS=(
+  'dwarfs:dwarfs-universal'
+  'dwarfsck:dwarfs-universal'
+  'dwarfsextract:dwarfs-universal'
+  'iptables:xtables-nft-multi'
+  'iptables-save:xtables-nft-multi'
+  'mkdwarfs:dwarfs-universal'
+  'pasta:passt'
+)
+
+verify_system() {
+  local system=$1
+  local target_dir="$STATIC_ROOT/$system"
+  local bin_dir="$target_dir/bin"
+  local actual_build_info actual_files dynamic elf_header expected_build_info expected_files
+  local expected_machine manifest_files expected_manifest_files path machine pair name
+  local program_headers runtime_suffix target
+
+  case "$system" in
+    x86_64-linux) expected_machine='Advanced Micro Devices X86-64' ;;
+    aarch64-linux) expected_machine=AArch64 ;;
+  esac
+
+  [[ -d "$bin_dir" ]] || { echo "verify: missing $bin_dir" >&2; return 1; }
+  [[ -f "$target_dir/SHA256SUMS" ]] || { echo "verify: missing $target_dir/SHA256SUMS" >&2; return 1; }
+  [[ -f "$target_dir/BUILDINFO" ]] || { echo "verify: missing $target_dir/BUILDINFO" >&2; return 1; }
+
+  # The provenance fields must describe this checkout's recipe exactly. The
+  # recorded repo commit is informational: a documentation-only commit does
+  # not invalidate a bundle.
+  expected_build_info="$(
+    printf 'format=2\n'
+    printf 'target_system=%s\n' "$system"
+    printf 'partial=false\n'
+    printf 'flake_nix_sha256=%s\n' \
+      "$(sha256sum "$REPO_ROOT/flake.nix" | awk '{print $1}')"
+    printf 'flake_lock_sha256=%s\n' \
+      "$(sha256sum "$REPO_ROOT/flake.lock" | awk '{print $1}')"
+    printf 'rebuild_sha256=%s\n' \
+      "$(sha256sum "$SCRIPT_DIR/rebuild" | awk '{print $1}')"
+    printf 'alias.%s\n' "${REQUIRED_LINKS[@]/:/=}" | sort
+  )"
+  actual_build_info="$(grep -E '^(format|target_system|partial|flake_nix_sha256|flake_lock_sha256|rebuild_sha256)=' "$target_dir/BUILDINFO"
+    grep -E '^alias[.]' "$target_dir/BUILDINFO" | sort)"
+  [[ "$actual_build_info" == "$expected_build_info" ]] || {
+    echo "verify: stale build provenance in $target_dir/BUILDINFO" >&2
+    diff -u \
+      <(printf '%s\n' "$expected_build_info") \
+      <(printf '%s\n' "$actual_build_info") >&2 || true
+    return 1
+  }
+  for name in "${REQUIRED_PINS[@]}"; do
+    grep -Eq "^${name//./[.]}=.+" "$target_dir/BUILDINFO" || {
+      echo "verify: BUILDINFO lacks source pin $name" >&2
+      return 1
+    }
+  done
+
+  (cd "$target_dir" && sha256sum --check --strict SHA256SUMS)
+
+  manifest_files="$(awk '{print $2}' "$target_dir/SHA256SUMS" | sort)"
+  expected_manifest_files="$(printf 'bin/%s\n' "${REQUIRED_FILES[@]}" | sort)"
+  [[ "$manifest_files" == "$expected_manifest_files" ]] || {
+    echo "verify: manifest does not cover the exact regular-file set in $bin_dir" >&2
+    diff -u \
+      <(printf '%s\n' "$expected_manifest_files") \
+      <(printf '%s\n' "$manifest_files") >&2 || true
+    return 1
+  }
+
+  for name in "${REQUIRED_FILES[@]}"; do
+    path="$bin_dir/$name"
+    [[ -f "$path" && ! -L "$path" && -x "$path" ]] || {
+      echo "verify: missing regular executable: $path" >&2
+      return 1
+    }
+    if ! elf_header="$(readelf -h "$path" 2>&1)"; then
+      printf 'verify: readelf could not read ELF header for %s: %s\n' \
+        "$path" "$elf_header" >&2
+      return 1
+    fi
+    machine="$(awk -F: '/Machine:/{sub(/^[[:space:]]+/, "", $2); print $2}' <<<"$elf_header")"
+    [[ "$machine" == "$expected_machine" ]] || {
+      echo "verify: wrong machine for $path: $machine" >&2
+      return 1
+    }
+    if ! program_headers="$(readelf -l "$path" 2>&1)"; then
+      printf 'verify: readelf could not read program headers for %s: %s\n' \
+        "$path" "$program_headers" >&2
+      return 1
+    fi
+    ! grep INTERP <<<"$program_headers" >/dev/null || {
+      echo "verify: interpreter found in $path" >&2
+      return 1
+    }
+    if ! dynamic="$(readelf -d "$path" 2>&1)"; then
+      printf 'verify: readelf could not read dynamic section for %s: %s\n' \
+        "$path" "$dynamic" >&2
+      return 1
+    fi
+    ! grep NEEDED <<<"$dynamic" >/dev/null || {
+      echo "verify: dynamic dependency found in $path" >&2
+      return 1
+    }
+  done
+
+  for pair in "${REQUIRED_LINKS[@]}"; do
+    name=${pair%%:*}
+    target=${pair#*:}
+    path="$bin_dir/$name"
+    [[ -L "$path" && "$(readlink "$path")" == "$target" ]] || {
+      echo "verify: bad alias $path (expected relative target $target)" >&2
+      return 1
+    }
+  done
+
+  actual_files="$(find "$bin_dir" -mindepth 1 -maxdepth 1 -printf '%f\n' | sort)"
+  expected_files="$({ printf '%s\n' "${REQUIRED_FILES[@]}"; printf '%s\n' "${REQUIRED_LINKS[@]%%:*}"; } | sort)"
+  [[ "$actual_files" == "$expected_files" ]] || {
+    echo "verify: unexpected file set in $bin_dir" >&2
+    diff -u <(printf '%s\n' "$expected_files") <(printf '%s\n' "$actual_files") >&2 || true
+    return 1
+  }
+
+  if [[ "$system" == "$native_system" && $structural_only -ne 1 ]]; then
+    "$bin_dir/claude-code-proxy" --version >/dev/null
+    "$bin_dir/bwrap" --version >/dev/null
+    "$bin_dir/fuse-overlayfs" --version >/dev/null
+    "$bin_dir/passt" --version >/dev/null
+    "$bin_dir/iptables" --version >/dev/null
+    "$bin_dir/ip" -Version >/dev/null
+    "$bin_dir/ss" -Version >/dev/null
+    "$bin_dir/nix-static" --version >/dev/null
+    "$bin_dir/caddy" version >/dev/null
+    "$bin_dir/sops" --version >/dev/null 2>&1
+    "$bin_dir/socat" -V >/dev/null 2>&1
+    "$bin_dir/rclone" version >/dev/null
+    "$bin_dir/atuin" --version >/dev/null
+    "$bin_dir/pandoc" --version >/dev/null
+    # DwarFS 0.15.3 exposes its version in help, not a --version option.
+    "$bin_dir/mkdwarfs" --help >/dev/null
+    "$bin_dir/dwarfsck" --help >/dev/null
+    "$bin_dir/dwarfsextract" --help >/dev/null
+    "$bin_dir/dwarfs" --help >/dev/null
+  fi
+
+  runtime_suffix=
+  if [[ "$system" == "$native_system" && $structural_only -ne 1 ]]; then
+    runtime_suffix=' (including runtime smoke tests)'
+  fi
+  printf 'verify: %s OK%s\n' "$system" "$runtime_suffix"
+}
+
+if [[ "$requested" == all ]]; then
+  verify_system x86_64-linux
+  verify_system aarch64-linux
+else
+  verify_system "$requested"
+fi

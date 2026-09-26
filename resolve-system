@@ -1,0 +1,39 @@
+#!/usr/bin/env sh
+
+set -eu
+
+usage() {
+  cat <<'EOF'
+Usage: resolve-system [machine]
+
+Print the supported Nix system for machine (or for uname -m when omitted).
+EOF
+}
+
+if [ "$#" -gt 1 ]; then
+  usage >&2
+  exit 2
+fi
+if [ "$#" -eq 1 ]; then
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+  esac
+fi
+
+machine=${1:-$(uname -m)}
+
+case "$machine" in
+  x86_64 | amd64 | x86_64-linux)
+    printf '%s\n' x86_64-linux
+    ;;
+  aarch64 | arm64 | aarch64-linux)
+    printf '%s\n' aarch64-linux
+    ;;
+  *)
+    printf 'resolve-system: unsupported Linux architecture: %s\n' "$machine" >&2
+    exit 1
+    ;;
+esac

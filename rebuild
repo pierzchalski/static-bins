@@ -1,0 +1,938 @@
+#!/usr/bin/env bash
+
+# Rebuild one or all of the static tools into out/<system>/.
+#
+# The build host may be x86_64 or aarch64. TARGET_SYSTEM selects the output
+# architecture and is deliberately independent of the host; the repository
+# flake supplies both musl cross toolchains and a single pinned nixpkgs
+# package set.
+
+set -euo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
+REPO_ROOT=$SCRIPT_DIR
+RESOLVE_SYSTEM="$SCRIPT_DIR/resolve-system"
+
+usage() {
+  cat <<'EOF'
+Usage: rebuild --tool <tool|all> [--system x86_64-linux|aarch64-linux]
+               [--out DIR] [--partial]
+
+Tools:
+  claude-code-proxy, bwrap, fuse-overlayfs, passt, iptables, iproute2,
+  nix, caddy, sops, socat, rclone, pandoc, dwarfs, atuin, all
+
+Options:
+  --tool NAME   Tool to build, or "all" for the complete bundle.
+  --system SYS  Target system; defaults to the build host.
+  --out DIR     Output root (default: <repo>/out). The bundle is written to
+                DIR/<system>/{bin/,SHA256SUMS,BUILDINFO}.
+  --partial     Build a single tool into an otherwise empty bundle, skipping
+                the complete-set verification. For smoke checks only; the
+                result is not a releasable bundle.
+  -h, --help    Show this help.
+
+All Nix-built tools, both cross compilers, Rust 1.91.1, UPX, and the build
+utilities come from the repository flake. Outputs are staged outside the
+output directory and installed with an atomic rename. A successful build
+refreshes the target's SHA256SUMS manifest and BUILDINFO provenance.
+
+A single-tool build without --partial updates an existing complete bundle in
+place, after verifying that the bundle was built from this checkout's
+flake.nix, flake.lock, and rebuild.
+
+Environment: STATIC_BINS_MAX_JOBS (default 1), STATIC_BINS_CORES (default 2),
+STATIC_BINS_HTTP_CONNECTIONS (default: daemon setting),
+STATIC_BINS_ARTIFACT_JOBS (default 2).
+EOF
+}
+
+TOOL=
+TARGET_ARG=
+OUT_ROOT="$REPO_ROOT/out"
+PARTIAL=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --tool)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      TOOL=$2
+      shift 2
+      ;;
+    --system)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      TARGET_ARG=$2
+      shift 2
+      ;;
+    --out)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      OUT_ROOT=$2
+      shift 2
+      ;;
+    --partial)
+      PARTIAL=1
+      shift
+      ;;
+    *)
+      printf 'rebuild: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+if [[ -z "$TOOL" ]]; then
+  printf 'rebuild: --tool is required\n' >&2
+  usage >&2
+  exit 2
+fi
+if [[ $PARTIAL -eq 1 && "$TOOL" == all ]]; then
+  printf 'rebuild: --partial builds a single tool, not all\n' >&2
+  exit 2
+fi
+
+REQUESTED_TOOL=$TOOL
+TARGET_SYSTEM="$("$RESOLVE_SYSTEM" "${TARGET_ARG:-$(uname -m)}")"
+mkdir -p -- "$OUT_ROOT"
+OUT_ROOT="$(cd -- "$OUT_ROOT" && pwd -P)"
+FINAL_TARGET_DIR="$OUT_ROOT/$TARGET_SYSTEM"
+SCRATCH_PARENT="$REPO_ROOT/.tmp/static-bins"
+FLAKE_REF="$REPO_ROOT"
+NIX_MAX_JOBS=${STATIC_BINS_MAX_JOBS:-1}
+NIX_CORES=${STATIC_BINS_CORES:-2}
+NIX_HTTP_CONNECTIONS=${STATIC_BINS_HTTP_CONNECTIONS:-}
+ARTIFACT_JOBS=${STATIC_BINS_ARTIFACT_JOBS:-2}
+
+if [[ ! "$NIX_MAX_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'rebuild: STATIC_BINS_MAX_JOBS must be a positive integer\n' >&2
+  exit 2
+fi
+if [[ ! "$NIX_CORES" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'rebuild: STATIC_BINS_CORES must be a positive integer\n' >&2
+  exit 2
+fi
+if [[ -n "$NIX_HTTP_CONNECTIONS" && ! "$NIX_HTTP_CONNECTIONS" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'rebuild: STATIC_BINS_HTTP_CONNECTIONS must be a positive integer\n' >&2
+  exit 2
+fi
+if [[ ! "$ARTIFACT_JOBS" =~ ^[1-9][0-9]*$ ]]; then
+  printf 'rebuild: STATIC_BINS_ARTIFACT_JOBS must be a positive integer\n' >&2
+  exit 2
+fi
+
+case "$TARGET_SYSTEM" in
+  x86_64-linux)
+    TARGET_TRIPLE=x86_64-unknown-linux-musl
+    EXPECTED_MACHINE='Advanced Micro Devices X86-64'
+    RELEASE_ARCH=amd64
+    DWARFS_ARCH=x86_64
+    ;;
+  aarch64-linux)
+    TARGET_TRIPLE=aarch64-unknown-linux-musl
+    EXPECTED_MACHINE=AArch64
+    RELEASE_ARCH=arm64
+    DWARFS_ARCH=aarch64
+    ;;
+esac
+
+declare -ar ALL_TOOLS=(
+  claude-code-proxy
+  bwrap
+  fuse-overlayfs
+  passt
+  iptables
+  iproute2
+  nix
+  caddy
+  sops
+  socat
+  rclone
+  pandoc
+  dwarfs
+  atuin
+)
+
+is_known_tool=0
+for known_tool in "${ALL_TOOLS[@]}" all; do
+  if [[ "$TOOL" == "$known_tool" ]]; then
+    is_known_tool=1
+    break
+  fi
+done
+if [[ $is_known_tool -ne 1 ]]; then
+  printf 'rebuild: unknown tool: %s\n' "$TOOL" >&2
+  usage >&2
+  exit 2
+fi
+
+for command in nix bash flock sha256sum; do
+  if ! command -v "$command" >/dev/null 2>&1; then
+    printf 'rebuild: required command is missing: %s\n' "$command" >&2
+    exit 1
+  fi
+done
+
+file_sha256() {
+  local result
+  result="$(sha256sum -- "$1")"
+  printf '%s\n' "${result%% *}"
+}
+
+# Capture provenance before Nix snapshots/evaluates the flake. Hashing these
+# files only after a long build could stamp old outputs with new source hashes
+# if an editor changed the checkout while the build was running.
+CAPTURED_FLAKE_NIX_SHA256="$(file_sha256 "$REPO_ROOT/flake.nix")"
+CAPTURED_FLAKE_LOCK_SHA256="$(file_sha256 "$REPO_ROOT/flake.lock")"
+CAPTURED_REBUILD_SHA256="$(file_sha256 "$SCRIPT_DIR/rebuild")"
+CAPTURED_REPO_COMMIT=unknown
+CAPTURED_REPO_DIRTY=unknown
+if CAPTURED_REPO_COMMIT="$(git -C "$REPO_ROOT" rev-parse --verify --quiet HEAD 2>/dev/null)"; then
+  if [[ -z "$(git -C "$REPO_ROOT" status --porcelain --untracked-files=no)" ]]; then
+    CAPTURED_REPO_DIRTY=false
+  else
+    CAPTURED_REPO_DIRTY=true
+  fi
+else
+  CAPTURED_REPO_COMMIT=unknown
+fi
+
+assert_build_inputs_unchanged() {
+  local changed=0
+
+  if [[ "$(file_sha256 "$REPO_ROOT/flake.nix")" != "$CAPTURED_FLAKE_NIX_SHA256" ]]; then
+    printf 'rebuild: flake.nix changed during the build; refusing to publish\n' >&2
+    changed=1
+  fi
+  if [[ "$(file_sha256 "$REPO_ROOT/flake.lock")" != "$CAPTURED_FLAKE_LOCK_SHA256" ]]; then
+    printf 'rebuild: flake.lock changed during the build; refusing to publish\n' >&2
+    changed=1
+  fi
+  if [[ "$(file_sha256 "$SCRIPT_DIR/rebuild")" != "$CAPTURED_REBUILD_SHA256" ]]; then
+    printf 'rebuild: rebuild changed during the build; refusing to publish\n' >&2
+    changed=1
+  fi
+  return "$changed"
+}
+
+# Scope locking to this checkout. A global /tmp name made independent clones
+# block one another and still allowed two users to mutate this worktree at the
+# same time.
+mkdir -p "$SCRATCH_PARENT"
+LOCK_FILE="$SCRATCH_PARENT/$TARGET_SYSTEM.lock"
+exec {LOCK_FD}>"$LOCK_FILE"
+if ! flock -n "$LOCK_FD"; then
+  printf 'rebuild: another %s rebuild is already running\n' "$TARGET_SYSTEM" >&2
+  exit 1
+fi
+
+# Publication uses this stable, per-target recovery slot while the lock is
+# held. If the process was killed between the two atomic renames, restore the
+# old bundle before doing any new work. If both names exist, the verified new
+# bundle was already published and only the old backup cleanup was interrupted.
+RECOVERY_TARGET_DIR="$OUT_ROOT/.$TARGET_SYSTEM.old"
+if [[ -e "$RECOVERY_TARGET_DIR" || -L "$RECOVERY_TARGET_DIR" ]]; then
+  if [[ ! -d "$RECOVERY_TARGET_DIR" || -L "$RECOVERY_TARGET_DIR" ]]; then
+    printf 'rebuild: recovery path is not a directory: %s\n' \
+      "$RECOVERY_TARGET_DIR" >&2
+    exit 1
+  fi
+  if [[ -e "$FINAL_TARGET_DIR" || -L "$FINAL_TARGET_DIR" ]]; then
+    rm -rf -- "$RECOVERY_TARGET_DIR"
+    printf 'rebuild: removed completed publication backup for %s\n' \
+      "$TARGET_SYSTEM"
+  else
+    mv -- "$RECOVERY_TARGET_DIR" "$FINAL_TARGET_DIR"
+    printf 'rebuild: restored interrupted publication for %s\n' \
+      "$TARGET_SYSTEM"
+  fi
+fi
+
+if [[ "$REQUESTED_TOOL" != all && $PARTIAL -ne 1 \
+  && (! -d "$FINAL_TARGET_DIR/bin" || ! -f "$FINAL_TARGET_DIR/SHA256SUMS") ]]; then
+  printf 'rebuild: %s has no complete baseline; rebuild all first (or pass --partial)\n' \
+    "$TARGET_SYSTEM" >&2
+  exit 1
+fi
+
+declare -A NIX_OUTPUTS=()
+declare -a REQUIRED_NIX_PACKAGES=(static-build-tools)
+
+nix_output() {
+  local package=$1
+  if [[ -z "${NIX_OUTPUTS[$package]:-}" ]]; then
+    printf 'rebuild: internal error: Nix output was not prefetched: %s\n' "$package" >&2
+    return 1
+  fi
+  printf '%s\n' "${NIX_OUTPUTS[$package]}"
+}
+
+nix_output_containing() {
+  local package=$1
+  shift
+  local output relative outputs
+
+  outputs="$(nix_output "$package")"
+  while IFS= read -r output; do
+    for relative in "$@"; do
+      if [[ -x "$output/$relative" ]]; then
+        printf '%s\n' "$output"
+        return 0
+      fi
+    done
+  done <<<"$outputs"
+
+  printf 'rebuild: no output from %s contains any of: %s\n' \
+    "$package" "$*" >&2
+  return 1
+}
+
+append_nix_package() {
+  local candidate=$1 existing
+  for existing in "${REQUIRED_NIX_PACKAGES[@]}"; do
+    [[ "$candidate" == "$existing" ]] && return
+  done
+  REQUIRED_NIX_PACKAGES+=("$candidate")
+}
+
+select_nix_packages() {
+  local selected=$1 package
+  case "$selected" in
+    all)
+      append_nix_package static-rust-toolchain
+      append_nix_package "static-cc-$TARGET_SYSTEM"
+      append_nix_package "static-binutils-$TARGET_SYSTEM"
+      for package in bwrap fuse-overlayfs passt iptables iproute2 nix caddy sops socat; do
+        append_nix_package "static-$package-$TARGET_SYSTEM"
+      done
+      ;;
+    claude-code-proxy)
+      append_nix_package static-rust-toolchain
+      append_nix_package "static-cc-$TARGET_SYSTEM"
+      append_nix_package "static-binutils-$TARGET_SYSTEM"
+      ;;
+    bwrap | fuse-overlayfs | passt | iptables | iproute2 | nix | caddy | sops | socat)
+      append_nix_package "static-binutils-$TARGET_SYSTEM"
+      append_nix_package "static-$selected-$TARGET_SYSTEM"
+      ;;
+    rclone)
+      append_nix_package "static-binutils-$TARGET_SYSTEM"
+      ;;
+    pandoc | dwarfs | atuin) ;;
+  esac
+}
+
+prefetch_nix_outputs() {
+  local host_system http_connections_label nix_pid output_file package path package_names=
+  local -a installables=() nix_options=()
+
+  for package in "${REQUIRED_NIX_PACKAGES[@]}"; do
+    installables+=("$FLAKE_REF#$package^out")
+    package_names+="\"$package\" "
+  done
+
+  # Realize all outputs together, then resolve their names in one evaluation.
+  # nix build prints store paths in store-path order, not installable order;
+  # never assign those lines positionally to the requested package names.
+  host_system="$("$RESOLVE_SYSTEM")"
+  http_connections_label=daemon-default
+  if [[ -n "$NIX_HTTP_CONNECTIONS" ]]; then
+    nix_options+=(--option http-connections "$NIX_HTTP_CONNECTIONS")
+    http_connections_label=$NIX_HTTP_CONNECTIONS
+  fi
+  printf 'rebuild: submitting %d Nix outputs (max-jobs=%s, cores=%s, http-connections=%s)\n' \
+    "${#installables[@]}" "$NIX_MAX_JOBS" "$NIX_CORES" "$http_connections_label"
+  output_file="$SCRATCH_ROOT/nix-output-paths"
+  (
+    # Only the parent owns the publication lock. If it is killed, a detached
+    # Nix client must not keep future rebuilds locked out.
+    exec {LOCK_FD}>&-
+    nix build --no-link --keep-going \
+      --no-update-lock-file --max-jobs "$NIX_MAX_JOBS" --cores "$NIX_CORES" \
+      "${nix_options[@]}" "${installables[@]}"
+    nix eval --raw --no-update-lock-file \
+      "$FLAKE_REF#packages.$host_system" \
+      --apply "ps: builtins.concatStringsSep \"\\n\" (map (name: name + \"\\t\" + ps.\${name}.outPath) [ $package_names ])"
+  ) >"$output_file" &
+  nix_pid=$!
+  if ! wait "$nix_pid"; then
+    printf 'rebuild: one or more Nix outputs failed\n' >&2
+    return 1
+  fi
+  while IFS=$'\t' read -r package path || [[ -n "$package" ]]; do
+    [[ -n "$package" && "$path" == /nix/store/* && -d "$path" ]] || {
+      printf 'rebuild: invalid named Nix output: %s %s\n' "$package" "$path" >&2
+      return 1
+    }
+    NIX_OUTPUTS["$package"]="$path"
+  done <"$output_file"
+  for package in "${REQUIRED_NIX_PACKAGES[@]}"; do
+    [[ -n "${NIX_OUTPUTS[$package]:-}" ]] || {
+      printf 'rebuild: missing named Nix output: %s\n' "$package" >&2
+      return 1
+    }
+  done
+}
+
+SCRATCH_ROOT="$(mktemp -d -p "$SCRATCH_PARENT" "$TARGET_SYSTEM.XXXXXX")"
+declare -a STAGED_FILES=()
+LAST_WORKER_PID=
+OLD_TARGET_DIR=
+
+terminate_workers() {
+  local pid
+  local -a active_workers=()
+
+  mapfile -t active_workers < <(jobs -pr)
+  # Job control makes each worker PID its process-group ID.
+  # Signal the whole group so cargo/curl/UPX children cannot outlive the worker
+  # shell and race cleanup of their scratch directory.
+  for pid in "${active_workers[@]}"; do
+    if kill -0 -- "-$pid" 2>/dev/null; then
+      kill -TERM -- "-$pid" 2>/dev/null || true
+    fi
+  done
+  for pid in "${active_workers[@]}"; do
+    wait "$pid" 2>/dev/null || true
+  done
+}
+
+cleanup() {
+  local cleanup_failed=0 exit_status=$1 staged
+
+  trap - EXIT INT TERM HUP
+  set +e
+  terminate_workers
+  for staged in "${STAGED_FILES[@]}"; do
+    if ! rm -f -- "$staged"; then
+      printf 'rebuild: WARNING: could not remove staged file %s\n' "$staged" >&2
+      cleanup_failed=1
+    fi
+  done
+  if [[ -n "$OLD_TARGET_DIR" && -d "$OLD_TARGET_DIR" && ! -e "$FINAL_TARGET_DIR" ]]; then
+    if mv -- "$OLD_TARGET_DIR" "$FINAL_TARGET_DIR"; then
+      OLD_TARGET_DIR=
+    else
+      printf 'rebuild: WARNING: could not restore %s; preserved backup at %s\n' \
+        "$FINAL_TARGET_DIR" "$OLD_TARGET_DIR" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if [[ -n "$OLD_TARGET_DIR" && -e "$FINAL_TARGET_DIR" && -d "$OLD_TARGET_DIR" ]]; then
+    if rm -rf -- "$OLD_TARGET_DIR"; then
+      OLD_TARGET_DIR=
+    else
+      printf 'rebuild: WARNING: could not remove publication backup %s\n' \
+        "$OLD_TARGET_DIR" >&2
+      cleanup_failed=1
+    fi
+  fi
+  if [[ -n "$SCRATCH_ROOT" && -e "$SCRATCH_ROOT" ]] \
+    && ! rm -rf -- "$SCRATCH_ROOT"; then
+    printf 'rebuild: WARNING: could not remove scratch directory %s\n' \
+      "$SCRATCH_ROOT" >&2
+    cleanup_failed=1
+  fi
+  if ((exit_status == 0 && cleanup_failed != 0)); then
+    exit_status=1
+  fi
+  exit "$exit_status"
+}
+trap 'cleanup $?' EXIT
+trap 'exit 130' INT
+trap 'exit 129' HUP
+trap 'exit 143' TERM
+
+# Non-interactive job control gives every managed Nix/artifact worker its own
+# process group, allowing cleanup to terminate its complete descendant tree.
+set -m
+select_nix_packages "$REQUESTED_TOOL"
+prefetch_nix_outputs
+
+STAGED_ROOT="$SCRATCH_ROOT/bundle"
+TARGET_DIR="$STAGED_ROOT/$TARGET_SYSTEM"
+mkdir -p "$STAGED_ROOT"
+if [[ "$REQUESTED_TOOL" != all && $PARTIAL -ne 1 && -d "$FINAL_TARGET_DIR" ]]; then
+  # Hard links make a whole-directory transaction cheap: replacing a staged
+  # executable creates a new inode and leaves the published bundle untouched.
+  cp -al -- "$FINAL_TARGET_DIR" "$TARGET_DIR"
+else
+  mkdir -p "$TARGET_DIR"
+fi
+BIN_DIR="$TARGET_DIR/bin"
+mkdir -p "$BIN_DIR"
+
+# Do not depend on incidental host tools. Nix itself is the bootstrap; all
+# subsequent commands are supplied by this flake output.
+BUILD_TOOLS="$(nix_output static-build-tools)"
+export PATH="$BUILD_TOOLS/bin:$PATH"
+
+# A one-tool update clones the rest of the published directory with hard
+# links. Validate that baseline before replacing anything: regenerating the
+# manifest later must not turn unnoticed drift in an unchanged file into a
+# newly trusted checksum.
+if [[ "$REQUESTED_TOOL" != all && $PARTIAL -ne 1 ]]; then
+  "$SCRIPT_DIR/verify" --root "$OUT_ROOT" --system "$TARGET_SYSTEM" \
+    --allow-cross --structural-only
+fi
+
+TARGET_BINUTILS=
+TARGET_STRIP=
+
+ensure_target_strip() {
+  if [[ -n "$TARGET_STRIP" ]]; then
+    return
+  fi
+
+  TARGET_BINUTILS="$(nix_output_containing "static-binutils-$TARGET_SYSTEM" \
+    "bin/$TARGET_TRIPLE-strip")"
+  TARGET_STRIP="$TARGET_BINUTILS/bin/$TARGET_TRIPLE-strip"
+}
+
+new_scratch() {
+  local path="$SCRATCH_ROOT/work-$1"
+  mkdir "$path"
+  printf '%s\n' "$path"
+}
+
+check_elf() {
+  local path=$1
+  local dynamic elf_header machine program_headers
+
+  [[ -x "$path" ]] || {
+    printf 'rebuild: not executable: %s\n' "$path" >&2
+    return 1
+  }
+  if ! elf_header="$(readelf -h "$path" 2>&1)"; then
+    printf 'rebuild: readelf could not read ELF header for %s: %s\n' \
+      "$path" "$elf_header" >&2
+    return 1
+  fi
+  machine="$(awk -F: '/Machine:/{sub(/^[[:space:]]+/, "", $2); print $2}' <<<"$elf_header")"
+  if [[ "$machine" != "$EXPECTED_MACHINE" ]]; then
+    printf 'rebuild: wrong ELF machine for %s: got %s, expected %s\n' \
+      "$path" "$machine" "$EXPECTED_MACHINE" >&2
+    return 1
+  fi
+  if ! program_headers="$(readelf -l "$path" 2>&1)"; then
+    printf 'rebuild: readelf could not read program headers for %s: %s\n' \
+      "$path" "$program_headers" >&2
+    return 1
+  fi
+  if grep 'INTERP' <<<"$program_headers" >/dev/null; then
+    printf 'rebuild: ELF has an interpreter (not static): %s\n' "$path" >&2
+    return 1
+  fi
+  if ! dynamic="$(readelf -d "$path" 2>&1)"; then
+    printf 'rebuild: readelf could not read dynamic section for %s: %s\n' \
+      "$path" "$dynamic" >&2
+    return 1
+  fi
+  if grep 'NEEDED' <<<"$dynamic" >/dev/null; then
+    printf 'rebuild: ELF has dynamic dependencies: %s\n' "$path" >&2
+    return 1
+  fi
+}
+
+install_binary() {
+  local source=$1
+  local name=$2
+  local staged="$TARGET_DIR/.$name.new.$$"
+
+  STAGED_FILES+=("$staged")
+  install -m 0755 "$source" "$staged"
+  check_elf "$staged"
+  mv -f "$staged" "$BIN_DIR/$name"
+  printf '%s: %s (%s)\n' "$name" "$(du -h "$BIN_DIR/$name" | awk '{print $1}')" \
+    "$(sha256sum "$BIN_DIR/$name" | awk '{print $1}')"
+}
+
+strip_and_pack() {
+  local path=$1
+  ensure_target_strip
+  "$TARGET_STRIP" "$path"
+  upx -q "$path"
+}
+
+build_nix_binary() {
+  local package=$1
+  local source_relative=$2
+  local output_name=$3
+  local pack=${4:-no}
+  local output scratch candidate
+
+  scratch="$(new_scratch "$output_name")"
+  output="$(nix_output "static-$package-$TARGET_SYSTEM")"
+  candidate="$scratch/$output_name"
+  cp "$output/$source_relative" "$candidate"
+  chmod u+w "$candidate"
+  ensure_target_strip
+  "$TARGET_STRIP" "$candidate"
+  if [[ "$pack" == yes ]]; then
+    upx -q "$candidate"
+  fi
+  install_binary "$candidate" "$output_name"
+}
+
+build_claude_code_proxy() {
+  # Ed's fork of raine/claude-code-proxy, branch eap/codex-cli-auth: upstream
+  # v0.1.42 (1e30e301) plus the unmerged upstream PR #122 (accept the second
+  # consecutive empty Codex completion after a non-error tool result instead of
+  # retrying it to a 503), a local widening of that check to look through the
+  # hook output Claude Code appends after the tool result, and CCP_CODEX_AUTH_FILE
+  # (use the Codex CLI's ~/.codex/auth.json as the credential store). The
+  # binary still reports 0.1.42. Each pinned commit carries a tag in the fork
+  # (eap/v<upstream>-<topic>) so it stays fetchable after the branch is rebased
+  # onto a newer upstream; tag before bumping, never move a tag.
+  local version=0.1.42
+  local commit=8af33cdf58fbbda24b9c5e83312c35c81f6dd842
+  local lock_sha256=ae50546b00bf4da3ca5b06ecf72675004969b50ceba1780c45915a1740d3ca93
+  local scratch rust_toolchain source_binary target_cc target_env_suffix
+
+  scratch="$(new_scratch claude-code-proxy)"
+  git init --quiet "$scratch/source"
+  git -C "$scratch/source" remote add origin https://github.com/pierzchalski/claude-code-proxy.git
+  git -C "$scratch/source" fetch --quiet --depth 1 origin "$commit"
+  git -C "$scratch/source" checkout --quiet FETCH_HEAD
+  [[ "$(git -C "$scratch/source" rev-parse HEAD)" == "$commit" ]] || {
+    echo 'rebuild: claude-code-proxy commit verification failed' >&2
+    return 1
+  }
+  [[ "$(sha256sum "$scratch/source/Cargo.lock" | awk '{print $1}')" == "$lock_sha256" ]] || {
+    echo 'rebuild: claude-code-proxy Cargo.lock verification failed' >&2
+    return 1
+  }
+
+  # Give the fetched standalone package its own workspace boundary so Cargo
+  # never adopts an enclosing Cargo.toml; its pinned dependencies and lockfile
+  # stay unchanged. (Kept from the devcontainer recipe, where scratch lived
+  # below a Cargo workspace, so the build inputs stay identical.)
+  printf '\n[workspace]\n' >>"$scratch/source/Cargo.toml"
+
+  rust_toolchain="$(nix_output static-rust-toolchain)"
+  target_cc="$(nix_output_containing "static-cc-$TARGET_SYSTEM" \
+    "bin/$TARGET_TRIPLE-gcc")"
+  ensure_target_strip
+  target_env_suffix=${TARGET_TRIPLE//-/_}
+  export PATH="$rust_toolchain/bin:$target_cc/bin:$PATH"
+  export "CC_$target_env_suffix=$target_cc/bin/$TARGET_TRIPLE-gcc"
+  export "AR_$target_env_suffix=$TARGET_BINUTILS/bin/$TARGET_TRIPLE-ar"
+  case "$TARGET_SYSTEM" in
+    x86_64-linux)
+      export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$target_cc/bin/$TARGET_TRIPLE-gcc"
+      ;;
+    aarch64-linux)
+      export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$target_cc/bin/$TARGET_TRIPLE-gcc"
+      ;;
+  esac
+  (
+    cd "$scratch/source"
+    RUSTC_WRAPPER='' cargo build --jobs "$NIX_CORES" --release --locked \
+      --target "$TARGET_TRIPLE"
+  )
+  source_binary="$scratch/source/target/$TARGET_TRIPLE/release/claude-code-proxy"
+  strip_and_pack "$source_binary"
+  if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
+    [[ "$("$source_binary" --version)" == "claude-code-proxy $version" ]]
+  fi
+  install_binary "$source_binary" claude-code-proxy
+}
+
+build_bwrap() {
+  build_nix_binary bwrap bin/bwrap bwrap
+}
+
+build_fuse_overlayfs() {
+  build_nix_binary fuse-overlayfs bin/fuse-overlayfs fuse-overlayfs
+}
+
+build_passt() {
+  build_nix_binary passt bin/passt passt
+  ln -sfn passt "$BIN_DIR/pasta"
+}
+
+build_iptables() {
+  build_nix_binary iptables bin/xtables-nft-multi xtables-nft-multi
+  ln -sfn xtables-nft-multi "$BIN_DIR/iptables"
+  ln -sfn xtables-nft-multi "$BIN_DIR/iptables-save"
+}
+
+build_iproute2() {
+  build_nix_binary iproute2 bin/ip ip
+  build_nix_binary iproute2 bin/ss ss
+}
+
+build_nix() {
+  build_nix_binary nix bin/nix nix-static yes
+}
+
+build_caddy() {
+  build_nix_binary caddy bin/caddy caddy yes
+}
+
+build_sops() {
+  build_nix_binary sops bin/sops sops yes
+}
+
+build_socat() {
+  build_nix_binary socat bin/socat socat
+}
+
+build_rclone() {
+  local version=1.74.2
+  local expected_sha256 url scratch archive candidate
+  case "$TARGET_SYSTEM" in
+    x86_64-linux) expected_sha256=72a806370072015ccbe4d81bcd348cc5eaf3beca6c65ba693fd43fb31fcca5b1 ;;
+    aarch64-linux) expected_sha256=bc2b2eb8269b743ed7bcea869f3782cfb4931e41efa53fc8befc6dc8308b7a50 ;;
+  esac
+  url="https://downloads.rclone.org/v$version/rclone-v$version-linux-$RELEASE_ARCH.zip"
+  scratch="$(new_scratch rclone)"
+  archive="$scratch/rclone.zip"
+  curl -fsSL -o "$archive" "$url"
+  [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$expected_sha256" ]] || {
+    echo 'rebuild: rclone release sha256 mismatch' >&2
+    return 1
+  }
+  unzip -q -j "$archive" "rclone-v$version-linux-$RELEASE_ARCH/rclone" -d "$scratch"
+  candidate="$scratch/rclone"
+  chmod u+w "$candidate"
+  strip_and_pack "$candidate"
+  if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
+    "$candidate" version | grep -F "rclone v$version" >/dev/null
+  fi
+  install_binary "$candidate" rclone
+}
+
+build_pandoc() {
+  local version=3.10.2
+  local expected_sha256 url scratch archive candidate
+  case "$TARGET_SYSTEM" in
+    x86_64-linux) expected_sha256=c7edd535941c48be6a362081a748272837de81ae11777202d9c341d3d8261c9a ;;
+    aarch64-linux) expected_sha256=1c4d69f2a092bd47cb180e58a4aab7b9637101ced928252458c7d41a7f7fa71d ;;
+  esac
+  url="https://github.com/jgm/pandoc/releases/download/$version/pandoc-$version-linux-$RELEASE_ARCH.tar.gz"
+  scratch="$(new_scratch pandoc)"
+  archive="$scratch/pandoc.tar.gz"
+  curl -fsSL -o "$archive" "$url"
+  [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$expected_sha256" ]] || {
+    echo 'rebuild: pandoc release sha256 mismatch' >&2
+    return 1
+  }
+  tar -xzf "$archive" -C "$scratch" "pandoc-$version/bin/pandoc"
+  candidate="$scratch/pandoc-$version/bin/pandoc"
+  chmod u+w "$candidate"
+  upx -q "$candidate"
+  if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
+    [[ "$("$candidate" --version | sed -n '1p')" == "pandoc $version" ]]
+  fi
+  install_binary "$candidate" pandoc
+}
+
+build_dwarfs() {
+  local version=0.15.3
+  local expected_sha256 url scratch candidate alias
+  case "$TARGET_SYSTEM" in
+    x86_64-linux) expected_sha256=30c868737fdf7b4167b35650839bcbce0fd73d203f83702bc0afa7eaa2e1bded ;;
+    aarch64-linux) expected_sha256=87a514821c762371a50dac7a271a6c78af3a23cc0c7cc47571713f8fb6707684 ;;
+  esac
+  url="https://github.com/mhx/dwarfs/releases/download/v$version/dwarfs-universal-$version-Linux-$DWARFS_ARCH"
+  scratch="$(new_scratch dwarfs)"
+  candidate="$scratch/dwarfs-universal"
+  curl -fsSL -o "$candidate" "$url"
+  [[ "$(sha256sum "$candidate" | awk '{print $1}')" == "$expected_sha256" ]] || {
+    echo 'rebuild: dwarfs release sha256 mismatch' >&2
+    return 1
+  }
+  chmod 0755 "$candidate"
+  install_binary "$candidate" dwarfs-universal
+  for alias in mkdwarfs dwarfsck dwarfsextract dwarfs; do
+    ln -sfn dwarfs-universal "$BIN_DIR/$alias"
+  done
+}
+
+build_atuin() {
+  local version=18.21.0
+  local expected_sha256 url scratch archive candidate
+  case "$TARGET_SYSTEM" in
+    x86_64-linux) expected_sha256=792e1867d113ba9bebec94996b3160164aba738e3d23987b3cddb9dee976ac08 ;;
+    aarch64-linux) expected_sha256=9b8a76df370eba71ea0809d4df74f79351be2314c1ed90cae229499e69ca2ee1 ;;
+  esac
+  url="https://github.com/atuinsh/atuin/releases/download/v$version/atuin-$TARGET_TRIPLE.tar.gz"
+  scratch="$(new_scratch atuin)"
+  archive="$scratch/atuin.tar.gz"
+  curl -fsSL -o "$archive" "$url"
+  [[ "$(sha256sum "$archive" | awk '{print $1}')" == "$expected_sha256" ]] || {
+    echo 'rebuild: atuin release sha256 mismatch' >&2
+    return 1
+  }
+  tar -xzf "$archive" -C "$scratch" "atuin-$TARGET_TRIPLE/atuin"
+  candidate="$scratch/atuin-$TARGET_TRIPLE/atuin"
+  chmod u+w "$candidate"
+  # Neither stripped nor UPX-packed here, unlike every other release download
+  # above. Upstream already ships it stripped (`file` reports "stripped"), and
+  # packing it would be actively harmful: atuin's shell integration runs the
+  # binary twice per prompt (`atuin history start` and `atuin history end`), and
+  # on this 39 MB image UPX self-extraction measured 147 ms per invocation
+  # against 2 ms unpacked (20 warm runs each, x86_64, 2026-09-16) — about 290 ms
+  # of added latency on every interactive command.
+  if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
+    [[ "$("$candidate" --version | awk '{print $2}')" == "$version" ]]
+  fi
+  install_binary "$candidate" atuin
+}
+
+refresh_manifest() {
+  local manifest="$TARGET_DIR/SHA256SUMS"
+  local staged="$TARGET_DIR/.SHA256SUMS.new.$$"
+  (
+    cd "$TARGET_DIR"
+    find bin -maxdepth 1 -type f -print0 | sort -z | xargs -0 sha256sum
+  ) >"$staged"
+  mv -f "$staged" "$manifest"
+}
+
+# Per-tool source pins for BUILDINFO. Release downloads and the Rust source
+# are pinned inside their build functions above; Nix-built tools are pinned by
+# the output store path, which the flake lock fully determines.
+nix_tool_pins() {
+  local host_system
+  host_system="$("$RESOLVE_SYSTEM")"
+  nix eval --raw --no-update-lock-file "$FLAKE_REF#packages.$host_system" \
+    --apply "ps: builtins.concatStringsSep \"\" (map (tool: \"pin.\" + tool + \".nix_out=\" + ps.\"static-\${tool}-$TARGET_SYSTEM\".outPath + \"\\n\") [ \"bwrap\" \"fuse-overlayfs\" \"passt\" \"iptables\" \"iproute2\" \"nix\" \"caddy\" \"sops\" \"socat\" ])"
+}
+
+source_pins() {
+  # Each build function declares its pin as `local` assignments; read them
+  # back from this script so BUILDINFO cannot drift from what was fetched.
+  awk -v target="$TARGET_SYSTEM" '
+    /^build_[a-z_]+\(\) \{$/ { fn = $1; sub(/^build_/, "", fn); sub(/\(\)$/, "", fn); gsub(/_/, "-", fn); next }
+    /^}$/ { fn = "" }
+    fn != "" && /^  local (version|commit|lock_sha256)=/ {
+      sub(/^  local /, ""); print "pin." fn "." $0
+    }
+    fn != "" && /remote add origin / { print "pin." fn ".repo=" $NF }
+    fn != "" && $0 ~ "^    " target "\\) expected_sha256=" {
+      line = $0; sub(/^.*expected_sha256=/, "", line); sub(/ ;;$/, "", line)
+      print "pin." fn ".sha256=" line
+    }
+  ' "$SCRIPT_DIR/rebuild"
+}
+
+refresh_build_info() {
+  local build_info="$TARGET_DIR/BUILDINFO"
+  local staged="$TARGET_DIR/.BUILDINFO.new.$$"
+  local link
+
+  {
+    printf 'format=2\n'
+    printf 'target_system=%s\n' "$TARGET_SYSTEM"
+    printf 'partial=%s\n' "$([[ $PARTIAL -eq 1 ]] && echo true || echo false)"
+    printf 'repo_commit=%s\n' "$CAPTURED_REPO_COMMIT"
+    printf 'repo_dirty=%s\n' "$CAPTURED_REPO_DIRTY"
+    printf 'flake_nix_sha256=%s\n' "$CAPTURED_FLAKE_NIX_SHA256"
+    printf 'flake_lock_sha256=%s\n' "$CAPTURED_FLAKE_LOCK_SHA256"
+    printf 'rebuild_sha256=%s\n' "$CAPTURED_REBUILD_SHA256"
+    source_pins
+    nix_tool_pins
+    while IFS= read -r link; do
+      printf 'alias.%s=%s\n' "$link" "$(readlink "$BIN_DIR/$link")"
+    done < <(find "$BIN_DIR" -mindepth 1 -maxdepth 1 -type l -printf '%f\n' | sort)
+  } >"$staged"
+  mv -f "$staged" "$build_info"
+}
+
+publish_full_bundle() {
+  OLD_TARGET_DIR="$RECOVERY_TARGET_DIR"
+  [[ ! -e "$OLD_TARGET_DIR" ]] || {
+    printf 'rebuild: refusing to overwrite stale publication backup: %s\n' \
+      "$OLD_TARGET_DIR" >&2
+    return 1
+  }
+
+  if [[ -e "$FINAL_TARGET_DIR" ]]; then
+    mv -- "$FINAL_TARGET_DIR" "$OLD_TARGET_DIR"
+  else
+    OLD_TARGET_DIR=
+  fi
+  if ! mv -- "$TARGET_DIR" "$FINAL_TARGET_DIR"; then
+    if [[ -n "$OLD_TARGET_DIR" && -e "$OLD_TARGET_DIR" ]]; then
+      mv -- "$OLD_TARGET_DIR" "$FINAL_TARGET_DIR"
+      OLD_TARGET_DIR=
+    fi
+    return 1
+  fi
+  if [[ -n "$OLD_TARGET_DIR" ]]; then
+    rm -rf -- "$OLD_TARGET_DIR"
+    OLD_TARGET_DIR=
+  fi
+}
+
+build_one() {
+  local tool=$1
+  printf '\n==> %s (%s)\n' "$tool" "$TARGET_SYSTEM"
+  "build_${tool//-/_}"
+}
+
+start_worker() {
+  local tool=$1
+
+  (
+    exec {LOCK_FD}>&-
+    build_one "$tool"
+  ) &
+  LAST_WORKER_PID=$!
+}
+
+build_all() {
+  local failed=0 running=0 tool
+
+  printf 'rebuild: assembling artifacts with %d concurrent workers\n' \
+    "$ARTIFACT_JOBS"
+  for tool in "${ALL_TOOLS[@]}"; do
+    start_worker "$tool"
+    running=$((running + 1))
+    if ((running >= ARTIFACT_JOBS)); then
+      if ! wait -n; then
+        failed=1
+      fi
+      running=$((running - 1))
+    fi
+  done
+  while ((running > 0)); do
+    if ! wait -n; then
+      failed=1
+    fi
+    running=$((running - 1))
+  done
+  return "$failed"
+}
+
+build_single() {
+  local status=0 worker_pid
+
+  start_worker "$1"
+  worker_pid=$LAST_WORKER_PID
+  if ! wait "$worker_pid"; then
+    status=1
+  fi
+  return "$status"
+}
+
+if [[ "$TOOL" == all ]]; then
+  build_all
+else
+  build_single "$TOOL"
+fi
+set +m
+
+assert_build_inputs_unchanged
+refresh_build_info
+refresh_manifest
+if [[ $PARTIAL -ne 1 ]]; then
+  "$SCRIPT_DIR/verify" --root "$STAGED_ROOT" --system "$TARGET_SYSTEM" --allow-cross
+fi
+assert_build_inputs_unchanged
+publish_full_bundle
+printf 'rebuild: published verified %s bundle\n' "$FINAL_TARGET_DIR"
