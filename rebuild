@@ -577,19 +577,18 @@ build_nix_binary() {
 }
 
 build_claude_code_proxy() {
-  # Ed's fork of raine/claude-code-proxy, branch eap/codex-cli-auth: upstream
-  # v0.1.42 (1e30e301) plus the unmerged upstream PR #122 (accept the second
-  # consecutive empty Codex completion after a non-error tool result instead of
-  # retrying it to a 503), a local widening of that check to look through the
-  # hook output Claude Code appends after the tool result, and CCP_CODEX_AUTH_FILE
-  # (use the Codex CLI's ~/.codex/auth.json as the credential store). The
-  # binary still reports 0.1.42. Each pinned commit carries a tag in the fork
+  # Ed's fork of raine/claude-code-proxy, tag eap/v0.1.42-dynamic-models:
+  # upstream v0.1.42 plus the fork's Codex changes (CCP_CODEX_AUTH_FILE, the
+  # empty-completion handling from eap/v0.1.42-codex-cli-auth) and a Codex
+  # model catalog loaded from the Codex backend's /models endpoint. The binary
+  # still reports 0.1.42. Each pinned commit carries a tag in the fork
   # (eap/v<upstream>-<topic>) so it stays fetchable after the branch is rebased
   # onto a newer upstream; tag before bumping, never move a tag.
   local version=0.1.42
-  local commit=8af33cdf58fbbda24b9c5e83312c35c81f6dd842
+  local commit=b885d40bdb359204fd8fb05fc28a9a78c607a71d
   local lock_sha256=ae50546b00bf4da3ca5b06ecf72675004969b50ceba1780c45915a1740d3ca93
-  local scratch rust_toolchain source_binary target_cc target_env_suffix
+  local cargo_home remap_flags scratch rust_toolchain source_binary target_cc
+  local target_env_suffix
 
   scratch="$(new_scratch claude-code-proxy)"
   git init --quiet "$scratch/source"
@@ -627,9 +626,25 @@ build_claude_code_proxy() {
       export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER="$target_cc/bin/$TARGET_TRIPLE-gcc"
       ;;
   esac
+  # Map the build-host paths rustc would otherwise embed (panic locations and
+  # debug strings name the registry sources and the checkout) to fixed ones,
+  # so the binary does not depend on CARGO_HOME or the scratch directory.
+  cargo_home=${CARGO_HOME:-$HOME/.cargo}
+  mkdir -p -- "$cargo_home"
+  remap_flags=(
+    "--remap-path-prefix=$cargo_home=/cargo"
+    "--remap-path-prefix=$scratch/source=/build/claude-code-proxy"
+  )
+  if [[ "$(cd -- "$cargo_home" && pwd -P)" != "$cargo_home" ]]; then
+    remap_flags+=("--remap-path-prefix=$(cd -- "$cargo_home" && pwd -P)=/cargo")
+  fi
   (
     cd "$scratch/source"
-    RUSTC_WRAPPER='' cargo build --jobs "$NIX_CORES" --release --locked \
+    # Cargo splits CARGO_ENCODED_RUSTFLAGS on 0x1f only, so paths may contain
+    # spaces. With --target these flags apply to target artifacts only.
+    CARGO_HOME=$cargo_home \
+      CARGO_ENCODED_RUSTFLAGS="$(IFS=$'\x1f'; printf '%s' "${remap_flags[*]}")" \
+      RUSTC_WRAPPER='' cargo build --jobs "$NIX_CORES" --release --locked \
       --target "$TARGET_TRIPLE"
   )
   source_binary="$scratch/source/target/$TARGET_TRIPLE/release/claude-code-proxy"
