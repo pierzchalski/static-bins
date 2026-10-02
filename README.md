@@ -8,17 +8,17 @@ release assets.
 | --- | --- | --- |
 | `atuin` | [Atuin](https://atuin.sh) — shell history sync and search | upstream release, sha256-pinned |
 | `bwrap` | [Bubblewrap](https://github.com/containers/bubblewrap) — unprivileged sandboxing | nixpkgs `pkgsStatic` |
-| `caddy` | [Caddy](https://caddyserver.com) — HTTP server | nixpkgs `pkgsStatic`, stripped, UPX |
-| `claude-code-proxy` | [pierzchalski/claude-code-proxy](https://github.com/pierzchalski/claude-code-proxy), a fork of [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) | pinned commit, Rust 1.91.1 musl, stripped, UPX |
+| `caddy` | [Caddy](https://caddyserver.com) — HTTP server | nixpkgs `pkgsStatic` |
+| `claude-code-proxy` | [pierzchalski/claude-code-proxy](https://github.com/pierzchalski/claude-code-proxy), a fork of [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) | pinned commit, Rust 1.91.1 musl |
 | `dwarfs-universal` | [DwarFS](https://github.com/mhx/dwarfs) — compressed read-only filesystem (`dwarfs`, `dwarfsck`, `dwarfsextract`, `mkdwarfs` aliases) | upstream release, sha256-pinned |
 | `fuse-overlayfs` | [fuse-overlayfs](https://github.com/containers/fuse-overlayfs) — FUSE overlayfs implementation | nixpkgs `pkgsStatic` |
 | `ip`, `ss` | [iproute2](https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/) — Linux networking utilities | nixpkgs `pkgsStatic` |
-| `nix-static` | [Nix](https://nixos.org/nix) — Nix package manager CLI | nixpkgs `pkgsStatic` (`nix.nix-cli`), stripped, UPX |
-| `pandoc` | [Pandoc](https://github.com/jgm/pandoc) — document converter | upstream release, sha256-pinned, UPX |
+| `nix-static` | [Nix](https://nixos.org/nix) — Nix package manager CLI | nixpkgs `pkgsStatic` (`nix.nix-cli`) |
+| `pandoc` | [Pandoc](https://github.com/jgm/pandoc) — document converter | upstream release, sha256-pinned |
 | `passt` | [passt](https://passt.top/passt/about/) — user-mode network connectivity (`pasta` alias) | nixpkgs `pkgsStatic` |
-| `rclone` | [rclone](https://rclone.org) — cloud storage sync | upstream release, sha256-pinned, stripped, UPX |
+| `rclone` | [rclone](https://rclone.org) — cloud storage sync | upstream release, sha256-pinned |
 | `socat` | [socat](http://www.dest-unreach.org/socat/) — bidirectional data relay | nixpkgs `pkgsStatic` |
-| `sops` | [SOPS](https://getsops.io/) — secrets encryption | nixpkgs `pkgsStatic`, stripped, UPX |
+| `sops` | [SOPS](https://getsops.io/) — secrets encryption | nixpkgs `pkgsStatic` |
 | `xtables-nft-multi` | [iptables](https://www.netfilter.org/projects/iptables/index.html) — packet filtering (`iptables`, `iptables-save` aliases) | nixpkgs `pkgsStatic` |
 
 Every file is checked to be a static ELF for its target (no interpreter, no

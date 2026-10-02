@@ -94,7 +94,6 @@
             gnutar
             gzip
             unzip
-            upx
           ];
         };
         static-cc-x86_64-linux = static-targets.x86_64-linux.stdenv.cc;

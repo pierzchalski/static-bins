@@ -33,9 +33,10 @@ Options:
                 result is not a releasable bundle.
   -h, --help    Show this help.
 
-All Nix-built tools, both cross compilers, Rust 1.91.1, UPX, and the build
-utilities come from the repository flake. Outputs are staged outside the
-output directory and installed with an atomic rename. A successful build
+All Nix-built tools, both cross compilers, Rust 1.91.1, and the build
+utilities come from the repository flake. Binaries are shipped as their
+source produces them: no extra strip pass and no executable packing. Outputs
+are staged outside the output directory and installed with an atomic rename. A successful build
 refreshes the target's SHA256SUMS manifest and BUILDINFO provenance.
 
 A single-tool build without --partial updates an existing complete bundle in
@@ -314,13 +315,9 @@ select_nix_packages() {
       append_nix_package "static-binutils-$TARGET_SYSTEM"
       ;;
     bwrap | fuse-overlayfs | passt | iptables | iproute2 | nix | caddy | sops | socat)
-      append_nix_package "static-binutils-$TARGET_SYSTEM"
       append_nix_package "static-$selected-$TARGET_SYSTEM"
       ;;
-    rclone)
-      append_nix_package "static-binutils-$TARGET_SYSTEM"
-      ;;
-    pandoc | dwarfs | atuin) ;;
+    rclone | pandoc | dwarfs | atuin) ;;
   esac
 }
 
@@ -387,7 +384,7 @@ terminate_workers() {
 
   mapfile -t active_workers < <(jobs -pr)
   # Job control makes each worker PID its process-group ID.
-  # Signal the whole group so cargo/curl/UPX children cannot outlive the worker
+  # Signal the whole group so cargo/curl children cannot outlive the worker
   # shell and race cleanup of their scratch directory.
   for pid in "${active_workers[@]}"; do
     if kill -0 -- "-$pid" 2>/dev/null; then
@@ -478,19 +475,6 @@ if [[ "$REQUESTED_TOOL" != all && $PARTIAL -ne 1 ]]; then
     --allow-cross --structural-only
 fi
 
-TARGET_BINUTILS=
-TARGET_STRIP=
-
-ensure_target_strip() {
-  if [[ -n "$TARGET_STRIP" ]]; then
-    return
-  fi
-
-  TARGET_BINUTILS="$(nix_output_containing "static-binutils-$TARGET_SYSTEM" \
-    "bin/$TARGET_TRIPLE-strip")"
-  TARGET_STRIP="$TARGET_BINUTILS/bin/$TARGET_TRIPLE-strip"
-}
-
 new_scratch() {
   local path="$SCRATCH_ROOT/work-$1"
   mkdir "$path"
@@ -549,30 +533,16 @@ install_binary() {
     "$(sha256sum "$BIN_DIR/$name" | awk '{print $1}')"
 }
 
-strip_and_pack() {
-  local path=$1
-  ensure_target_strip
-  "$TARGET_STRIP" "$path"
-  upx -q "$path"
-}
-
 build_nix_binary() {
   local package=$1
   local source_relative=$2
   local output_name=$3
-  local pack=${4:-no}
   local output scratch candidate
 
   scratch="$(new_scratch "$output_name")"
   output="$(nix_output "static-$package-$TARGET_SYSTEM")"
   candidate="$scratch/$output_name"
   cp "$output/$source_relative" "$candidate"
-  chmod u+w "$candidate"
-  ensure_target_strip
-  "$TARGET_STRIP" "$candidate"
-  if [[ "$pack" == yes ]]; then
-    upx -q "$candidate"
-  fi
   install_binary "$candidate" "$output_name"
 }
 
@@ -587,7 +557,8 @@ build_claude_code_proxy() {
   local version=0.1.42
   local commit=b885d40bdb359204fd8fb05fc28a9a78c607a71d
   local lock_sha256=ae50546b00bf4da3ca5b06ecf72675004969b50ceba1780c45915a1740d3ca93
-  local cargo_home remap_flags scratch rust_toolchain source_binary target_cc
+  local cargo_home remap_flags scratch rust_toolchain source_binary target_ar
+  local target_cc
   local target_env_suffix
 
   scratch="$(new_scratch claude-code-proxy)"
@@ -613,11 +584,12 @@ build_claude_code_proxy() {
   rust_toolchain="$(nix_output static-rust-toolchain)"
   target_cc="$(nix_output_containing "static-cc-$TARGET_SYSTEM" \
     "bin/$TARGET_TRIPLE-gcc")"
-  ensure_target_strip
+  target_ar="$(nix_output_containing "static-binutils-$TARGET_SYSTEM" \
+    "bin/$TARGET_TRIPLE-ar")/bin/$TARGET_TRIPLE-ar"
   target_env_suffix=${TARGET_TRIPLE//-/_}
   export PATH="$rust_toolchain/bin:$target_cc/bin:$PATH"
   export "CC_$target_env_suffix=$target_cc/bin/$TARGET_TRIPLE-gcc"
-  export "AR_$target_env_suffix=$TARGET_BINUTILS/bin/$TARGET_TRIPLE-ar"
+  export "AR_$target_env_suffix=$target_ar"
   case "$TARGET_SYSTEM" in
     x86_64-linux)
       export CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER="$target_cc/bin/$TARGET_TRIPLE-gcc"
@@ -648,7 +620,6 @@ build_claude_code_proxy() {
       --target "$TARGET_TRIPLE"
   )
   source_binary="$scratch/source/target/$TARGET_TRIPLE/release/claude-code-proxy"
-  strip_and_pack "$source_binary"
   if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
     [[ "$("$source_binary" --version)" == "claude-code-proxy $version" ]]
   fi
@@ -680,15 +651,15 @@ build_iproute2() {
 }
 
 build_nix() {
-  build_nix_binary nix bin/nix nix-static yes
+  build_nix_binary nix bin/nix nix-static
 }
 
 build_caddy() {
-  build_nix_binary caddy bin/caddy caddy yes
+  build_nix_binary caddy bin/caddy caddy
 }
 
 build_sops() {
-  build_nix_binary sops bin/sops sops yes
+  build_nix_binary sops bin/sops sops
 }
 
 build_socat() {
@@ -713,7 +684,6 @@ build_rclone() {
   unzip -q -j "$archive" "rclone-v$version-linux-$RELEASE_ARCH/rclone" -d "$scratch"
   candidate="$scratch/rclone"
   chmod u+w "$candidate"
-  strip_and_pack "$candidate"
   if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
     "$candidate" version | grep -F "rclone v$version" >/dev/null
   fi
@@ -738,7 +708,6 @@ build_pandoc() {
   tar -xzf "$archive" -C "$scratch" "pandoc-$version/bin/pandoc"
   candidate="$scratch/pandoc-$version/bin/pandoc"
   chmod u+w "$candidate"
-  upx -q "$candidate"
   if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
     [[ "$("$candidate" --version | sed -n '1p')" == "pandoc $version" ]]
   fi
@@ -785,13 +754,6 @@ build_atuin() {
   tar -xzf "$archive" -C "$scratch" "atuin-$TARGET_TRIPLE/atuin"
   candidate="$scratch/atuin-$TARGET_TRIPLE/atuin"
   chmod u+w "$candidate"
-  # Neither stripped nor UPX-packed here, unlike every other release download
-  # above. Upstream already ships it stripped (`file` reports "stripped"), and
-  # packing it would be actively harmful: atuin's shell integration runs the
-  # binary twice per prompt (`atuin history start` and `atuin history end`), and
-  # on this 39 MB image UPX self-extraction measured 147 ms per invocation
-  # against 2 ms unpacked (20 warm runs each, x86_64, 2026-09-16) — about 290 ms
-  # of added latency on every interactive command.
   if [[ "$("$RESOLVE_SYSTEM")" == "$TARGET_SYSTEM" ]]; then
     [[ "$("$candidate" --version | awk '{print $2}')" == "$version" ]]
   fi
