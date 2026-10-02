@@ -6,25 +6,29 @@ release assets.
 
 | File in `bin/` | What | Built from |
 | --- | --- | --- |
-| `atuin` | shell history | upstream release, sha256-pinned |
-| `bwrap` | Bubblewrap | nixpkgs `pkgsStatic` |
-| `caddy` | Caddy | nixpkgs `pkgsStatic`, stripped, UPX |
-| `claude-code-proxy` | [pierzchalski/claude-code-proxy](https://github.com/pierzchalski/claude-code-proxy) | pinned commit, Rust 1.91.1 musl, stripped, UPX |
-| `dwarfs-universal` | DwarFS (`dwarfs`, `dwarfsck`, `dwarfsextract`, `mkdwarfs` aliases) | upstream release, sha256-pinned |
-| `fuse-overlayfs` | fuse-overlayfs | nixpkgs `pkgsStatic` |
-| `ip`, `ss` | iproute2 | nixpkgs `pkgsStatic` |
-| `nix-static` | Nix CLI | nixpkgs `pkgsStatic` (`nix.nix-cli`), stripped, UPX |
-| `pandoc` | Pandoc | upstream release, sha256-pinned, UPX |
-| `passt` | passt (`pasta` alias) | nixpkgs `pkgsStatic` |
-| `rclone` | rclone | upstream release, sha256-pinned, stripped, UPX |
-| `socat` | socat | nixpkgs `pkgsStatic` |
-| `sops` | SOPS | nixpkgs `pkgsStatic`, stripped, UPX |
-| `xtables-nft-multi` | iptables (`iptables`, `iptables-save` aliases) | nixpkgs `pkgsStatic` |
+| `atuin` | [Atuin](https://atuin.sh) — shell history sync and search | upstream release, sha256-pinned |
+| `bwrap` | [Bubblewrap](https://github.com/containers/bubblewrap) — unprivileged sandboxing | nixpkgs `pkgsStatic` |
+| `caddy` | [Caddy](https://caddyserver.com) — HTTP server | nixpkgs `pkgsStatic` |
+| `claude-code-proxy` | [pierzchalski/claude-code-proxy](https://github.com/pierzchalski/claude-code-proxy), a fork of [raine/claude-code-proxy](https://github.com/raine/claude-code-proxy) | pinned commit, Rust 1.91.1 musl |
+| `dwarfs-universal` | [DwarFS](https://github.com/mhx/dwarfs) — compressed read-only filesystem (`dwarfs`, `dwarfsck`, `dwarfsextract`, `mkdwarfs` aliases) | upstream release, sha256-pinned |
+| `fuse-overlayfs` | [fuse-overlayfs](https://github.com/containers/fuse-overlayfs) — FUSE overlayfs implementation | nixpkgs `pkgsStatic` |
+| `ip`, `ss` | [iproute2](https://git.kernel.org/pub/scm/network/iproute2/iproute2.git/) — Linux networking utilities | nixpkgs `pkgsStatic` |
+| `nix-static` | [Nix](https://nixos.org/nix) — Nix package manager CLI | nixpkgs `pkgsStatic` (`nix.nix-cli`) |
+| `pandoc` | [Pandoc](https://github.com/jgm/pandoc) — document converter | upstream release, sha256-pinned |
+| `passt` | [passt](https://passt.top/passt/about/) — user-mode network connectivity (`pasta` alias) | nixpkgs `pkgsStatic` |
+| `rclone` | [rclone](https://rclone.org) — cloud storage sync | upstream release, sha256-pinned |
+| `socat` | [socat](http://www.dest-unreach.org/socat/) — bidirectional data relay | nixpkgs `pkgsStatic` |
+| `sops` | [SOPS](https://getsops.io/) — secrets encryption | nixpkgs `pkgsStatic` |
+| `xtables-nft-multi` | [iptables](https://www.netfilter.org/projects/iptables/index.html) — packet filtering (`iptables`, `iptables-save` aliases) | nixpkgs `pkgsStatic` |
 
 Every file is checked to be a static ELF for its target (no interpreter, no
 `NEEDED` entries). The MIT license in this repository covers the build
-scripts only; each binary carries its upstream project's license, and
-`BUILDINFO` records the exact source it was built from.
+scripts only. Each binary is under its upstream project's licence:
+`THIRD_PARTY_NOTICES.md` in every release lists each tool's version, SPDX
+licence and upstream, and the libraries linked into it, and `licenses/<tool>/`
+holds the licence texts, copied from the exact pinned sources. Both ship in
+each per-system tarball and as the `licenses.tar.gz` release asset.
+`BUILDINFO` records the exact source each binary was built from.
 
 ## Release assets
 
@@ -39,7 +43,16 @@ Each release (tag `vYYYY.MM.DD`) carries, per system:
   or Nix output path), and one `alias.<name>=<target>` line per multicall
   alias.
 - `static-bins-<system>.tar.gz`: `bin/` (aliases as relative symlinks, mode
-  0755), `SHA256SUMS`, and `BUILDINFO`, for one-download installs.
+  0755), `SHA256SUMS`, `BUILDINFO`, `THIRD_PARTY_NOTICES.md` and `licenses/`,
+  for one-download installs.
+
+Plus, once per release:
+
+- `licenses.tar.gz`: `THIRD_PARTY_NOTICES.md` and `licenses/`, the licence
+  texts for both systems (identical; CI checks that the two builds agree).
+
+The licence files are not listed in `SHA256SUMS-<system>`, which covers
+exactly the files in `bin/`.
 
 ## Installing (consumer contract)
 
@@ -87,6 +100,7 @@ toolchains, comes from `flake.nix`.
 ./verify --system x86_64-linux                # runs smoke tests natively
 ./verify --system aarch64-linux --allow-cross # structural checks only
 ./rebuild --tool rclone --system x86_64-linux # update one tool in a complete bundle
+./notices --out out/notices                   # licence texts, both systems
 ./package --system x86_64-linux --out dist    # release assets
 ```
 
@@ -97,13 +111,19 @@ smoke checks. Tuning knobs (`STATIC_BINS_MAX_JOBS`, `STATIC_BINS_CORES`,
 `STATIC_BINS_ARTIFACT_JOBS`, `STATIC_BINS_HTTP_CONNECTIONS`) are described in
 `./rebuild --help`.
 
+`notices` evaluates `licenses.nix` (each Nix-built tool's static closure),
+fetches the pinned sources and copies their licence files; see
+`./notices --help` for what it covers and what it leaves to upstream.
+
 ## Adding or bumping a tool
 
 - **Upstream release download** (rclone, pandoc, dwarfs, atuin): edit the
   `version` and both per-system `expected_sha256` values in the tool's
   `build_<tool>` function in `rebuild`. Get the hashes by downloading both
   archives and running `sha256sum`, and check them against upstream's
-  published checksums where it has them.
+  published checksums where it has them. Then update the tool's rows in the
+  pin table in `notices` (licence file URLs at the new tag, and their
+  sha256); `notices` refuses to run while the versions disagree.
 - **claude-code-proxy**: tag the new commit in the fork
   (`eap/v<upstream>-<topic>`; never move a tag), then update `version`,
   `commit` and `lock_sha256` (the sha256 of its `Cargo.lock`) in
@@ -115,7 +135,9 @@ smoke checks. Tuning knobs (`STATIC_BINS_MAX_JOBS`, `STATIC_BINS_CORES`,
   and a `build_<tool>` function in `rebuild`; to `REQUIRED_FILES`,
   `REQUIRED_PINS`, `REQUIRED_LINKS` and the smoke tests in `verify`; to the
   `nix_tool_pins` list in `rebuild` and a `static-<tool>-<system>` output in
-  `flake.nix` if Nix-built; and to the table above.
+  `flake.nix` if Nix-built; to `licenses.nix` (Nix-built) or the pin table
+  in `notices` (anything else), and the `tools` list in `notices`; and to the
+  table above.
 
 Then run `./rebuild --tool all` for both systems and `./verify` before opening
 a PR. Pull requests run a small smoke build (one Nix tool) in CI, not the

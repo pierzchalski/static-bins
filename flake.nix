@@ -94,7 +94,7 @@
             gnutar
             gzip
             unzip
-            upx
+            libarchive
           ];
         };
         static-cc-x86_64-linux = static-targets.x86_64-linux.stdenv.cc;
@@ -104,6 +104,12 @@
       };
   in {
     packages = for-each-host host-packages;
+    # Tab-separated licence inventory of the Nix-built tools (see licenses.nix).
+    license-inventory = for-each-host (system:
+      import ./licenses.nix {
+        inherit (nixpkgs) lib;
+        packages = host-packages system;
+      });
     formatter = for-each-host (system: nixpkgs.legacyPackages.${system}.alejandra);
   };
 }
