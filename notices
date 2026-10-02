@@ -1,0 +1,462 @@
+#!/usr/bin/env bash
+
+# Collect the licence texts for everything inside the static-bins binaries.
+
+set -euo pipefail
+export LC_ALL=C
+
+SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
+REPO_ROOT=$SCRIPT_DIR
+RESOLVE_SYSTEM="$SCRIPT_DIR/resolve-system"
+
+usage() {
+  cat <<'EOF_USAGE'
+Usage: notices --out DIR
+
+Writes DIR/THIRD_PARTY_NOTICES.md and DIR/licenses/<tool>/..., covering both
+target systems (the result does not depend on the build host or target):
+
+- Nix-built tools: licence files from the pinned source of the tool and of
+  every library in its static closure (licenses.nix: buildInputs and
+  propagatedBuildInputs, recursively, plus musl, the GCC runtime and, for Go
+  tools, the Go toolchain and the vendored Go modules).
+- claude-code-proxy: the fork's LICENSE at the commit pinned in rebuild, the
+  licence files of every crate in its Cargo.lock (cargo vendor), and the Rust
+  standard library's licences from the pinned toolchain.
+- atuin, pandoc, rclone, dwarfs: licence files from the release archive when
+  it carries them, otherwise from the upstream repository at the release tag,
+  each pinned by sha256.
+
+Language-ecosystem dependencies of the four upstream release binaries (Go,
+Rust and Haskell libraries) are not collected; THIRD_PARTY_NOTICES.md says
+where upstream documents them.
+
+Options:
+  --out DIR   Output directory; must not exist yet.
+  -h, --help  Show this help.
+EOF_USAGE
+}
+
+out=
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    -h | --help)
+      usage
+      exit 0
+      ;;
+    --out)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      out=$2
+      shift 2
+      ;;
+    *)
+      printf 'notices: unknown argument: %s\n' "$1" >&2
+      usage >&2
+      exit 2
+      ;;
+  esac
+done
+[[ -n "$out" ]] || { printf 'notices: --out is required\n' >&2; usage >&2; exit 2; }
+[[ ! -e "$out" ]] || { printf 'notices: %s already exists\n' "$out" >&2; exit 1; }
+
+die() {
+  printf 'notices: %s\n' "$*" >&2
+  exit 1
+}
+
+host_system="$("$RESOLVE_SYSTEM")"
+flake_ref=$REPO_ROOT
+build_tools="$(nix build --no-link --print-out-paths --no-update-lock-file "$flake_ref#static-build-tools")"
+rust_toolchain="$(nix build --no-link --print-out-paths --no-update-lock-file "$flake_ref#static-rust-toolchain")"
+export PATH="$build_tools/bin:$rust_toolchain/bin:$PATH"
+
+mkdir -p -- "$(dirname -- "$out")"
+out="$(cd -- "$(dirname -- "$out")" && pwd -P)/$(basename -- "$out")"
+work="$(mktemp -d "$(dirname -- "$out")/.notices.XXXXXX")"
+trap 'rm -rf -- "$work"' EXIT
+staging="$work/out"
+mkdir -p "$staging/licenses"
+
+# A licence-like file: LICENSE*, LICENCE*, COPYING*, COPYRIGHT*, NOTICE*,
+# UNLICENSE*, PATENTS* (any case), or anything below a LICENSES/ directory
+# (REUSE layout). Source-code files that merely have such names are skipped.
+is_licence_path() {
+  local path=$1 base
+  base=${path##*/}
+  base=${base,,}
+  case "/${path,,}" in
+    */licenses/*) return 0 ;;
+  esac
+  [[ "$base" =~ ^(licen[cs]e|copying|copyright|notice|unlicense|patents) ]] || return 1
+  [[ ! "$base" =~ \.(c|h|cc|cpp|hpp|go|rs|py|js|ts|java|rb|pl|pm|sh|m4|am|ac|tcl|json|ya?ml|xml|cmake|mk|s|hs|lua|nix|vim|el|swift|kt|cs|php)$ ]]
+}
+
+# bsdtar needs a UTF-8 locale for non-ASCII member names.
+bsdtar() {
+  LC_ALL=C.UTF-8 command bsdtar "$@"
+}
+
+# licence_tree SOURCE: extract SOURCE's licence files once (SOURCE is a
+# directory or an archive; a single top-level directory is stripped) and set
+# TREE to the directory holding them. Not for use in a subshell: the cache
+# would be lost.
+declare -A licence_cache=()
+cache_index=0
+licence_tree() {
+  local source=$1 list member strip extract tree
+  if [[ -n "${licence_cache[$source]:-}" ]]; then
+    TREE=${licence_cache[$source]}
+    return 0
+  fi
+  cache_index=$((cache_index + 1))
+  tree="$work/cache/$cache_index"
+  mkdir -p "$tree"
+  list="$work/members"
+  if [[ -d "$source" ]]; then
+    (cd "$source" && find . \( -type f -o -type l \) -printf '%P\n') | sort >"$list"
+  else
+    bsdtar -tf "$source" | grep -v '/$' | sort >"$list"
+  fi
+  strip=
+  if [[ ! -d "$source" ]]; then
+    strip="$(awk -F/ 'NR == 1 { top = $1 } $1 != top || NF < 2 { top = "" } END { print top }' "$list")"
+  fi
+  : >"$work/selected"
+  while IFS= read -r member; do
+    if is_licence_path "${member#"$strip"/}"; then
+      printf '%s\n' "$member" >>"$work/selected"
+    fi
+  done <"$list"
+  # Some projects state their licence only in the README; fall back to the
+  # top-level README files when there is no licence file at all.
+  if [[ ! -s "$work/selected" ]]; then
+    while IFS= read -r member; do
+      local relative=${member#"$strip"/}
+      if [[ "$relative" != */* && "${relative,,}" == readme* ]]; then
+        printf '%s\n' "$member" >>"$work/selected"
+      fi
+    done <"$list"
+    [[ ! -s "$work/selected" ]] || : >"$tree/.readme-fallback"
+  fi
+  if [[ -s "$work/selected" ]]; then
+    if [[ -d "$source" ]]; then
+      extract=$source
+    else
+      extract="$work/extract"
+      rm -rf "$extract"
+      mkdir "$extract"
+      bsdtar -xf "$source" -C "$extract" -T "$work/selected"
+    fi
+    while IFS= read -r member; do
+      # Dangling symlinks (a link whose target was not selected) are skipped.
+      [[ -f "$extract/$member" ]] || continue
+      mkdir -p "$tree/$(dirname -- "${member#"$strip"/}")"
+      install -m 0644 "$extract/$member" "$tree/${member#"$strip"/}"
+    done <"$work/selected"
+  fi
+  licence_cache[$source]=$tree
+  TREE=$tree
+}
+
+# copy_licence_files SOURCE DEST: copy SOURCE's licence files into DEST, set
+# COPIED to how many there were and README_ONLY to 1 if they are README files.
+TREE=
+COPIED=0
+README_ONLY=0
+copy_licence_files() {
+  licence_tree "$1"
+  COPIED="$(find "$TREE" -type f ! -name .readme-fallback | wc -l)"
+  if [[ "$COPIED" -gt 0 ]]; then
+    mkdir -p "$2"
+    cp -R -- "$TREE/." "$2/"
+    rm -f -- "$2/.readme-fallback"
+  fi
+  README_ONLY=0
+  [[ ! -e "$TREE/.readme-fallback" ]] || README_ONLY=1
+}
+
+fetch_pinned() {
+  local url=$1 expected=$2 output=$3 actual
+  curl -fsSL --retry 3 -o "$output" "$url" || die "download failed: $url"
+  actual="$(sha256sum "$output" | awk '{print $1}')"
+  [[ "$actual" == "$expected" ]] || die "sha256 mismatch for $url: got $actual, expected $expected"
+}
+
+# rebuild_value FUNCTION NAME: a `local NAME=value` from rebuild's build_FUNCTION.
+rebuild_value() {
+  awk -v fn="build_$1() {" -v key="  local $2=" '
+    $0 == fn { inside = 1; next }
+    inside && /^}$/ { exit }
+    inside && index($0, key) == 1 { print substr($0, length(key) + 1); exit }
+  ' "$SCRIPT_DIR/rebuild"
+}
+
+notes="$work/notes.tsv" # tool, component, version, licence, homepage, files
+: >"$notes"
+
+# --- Nix-built tools ------------------------------------------------------
+printf 'notices: evaluating the licence inventory\n' >&2
+nix eval --raw --no-update-lock-file "$flake_ref#license-inventory.$host_system" >"$work/inventory.tsv"
+
+declare -A src_out=()
+mapfile -t source_drvs < <(awk -F'\t' '{ n = split($8, a, " "); for (i = 1; i <= n; i++) print a[i] }' \
+  "$work/inventory.tsv" | sort -u)
+if [[ ${#source_drvs[@]} -gt 0 ]]; then
+  printf 'notices: fetching %d source derivations\n' "${#source_drvs[@]}" >&2
+  nix build --no-link --keep-going "${source_drvs[@]/%/^out}"
+  for drv in "${source_drvs[@]}"; do
+    src_out[$drv]="$(nix-store --query --outputs "$drv")"
+  done
+fi
+
+# Union over both targets; a cross compiler's name carries its triple.
+# Empty fields become "-" because read collapses adjacent tab separators. The
+# vendored Go module tree is platform-independent; one target's copy is kept.
+awk -F'\t' -v OFS='\t' '{
+  sub(/^(x86_64|aarch64)-unknown-linux-musl-/, "", $4)
+  for (i = 1; i <= 8; i++) if ($i == "") $i = "-"
+  if ($3 == "go-modules" && seen[$2]++) next
+  print $2, $3, $4, $5, $6, $7, $8
+}' "$work/inventory.tsv" | sort -u >"$work/components.tsv"
+
+declare -A seen_source=()
+while IFS=$'\t' read -r tool kind name version licence homepage drvs; do
+  if [[ "$kind" == go-modules ]]; then
+    component=go-modules
+  else
+    component="$name-$version"
+  fi
+  dest="$staging/licenses/$tool/$component"
+  files=0
+  note=
+  [[ "$drvs" != - ]] || drvs=
+  [[ "$homepage" != - ]] || homepage=
+  read -r -a drv_list <<<"$drvs"
+  [[ ${#drv_list[@]} -gt 0 ]] || note=' (no source derivation)'
+  for drv in "${drv_list[@]}"; do
+    source=${src_out[$drv]}
+    if [[ -n "${seen_source[$tool:$source]:-}" ]]; then
+      note=" (same source as ${seen_source[$tool:$source]})"
+      continue
+    fi
+    seen_source[$tool:$source]=$component
+    sub=$dest
+    if [[ ${#drv_list[@]} -gt 1 ]]; then
+      sub="$dest/$(basename -- "$source" | cut -d- -f2-)"
+    fi
+    copy_licence_files "$source" "$sub"
+    files=$((files + COPIED))
+    [[ "$README_ONLY" -eq 0 ]] || note=' (README only: no licence file in the source)'
+  done
+  printf '%s\t%s\t%s\t%s\t%s\t%s\n' "$tool" "$component" "$version" "$licence" "$homepage" "$files$note" >>"$notes"
+done <"$work/components.tsv"
+
+# --- claude-code-proxy ----------------------------------------------------
+ccp_commit="$(rebuild_value claude_code_proxy commit)"
+ccp_lock_sha256="$(rebuild_value claude_code_proxy lock_sha256)"
+ccp_version="$(rebuild_value claude_code_proxy version)"
+[[ -n "$ccp_commit" && -n "$ccp_lock_sha256" ]] || die "could not read the claude-code-proxy pin from rebuild"
+printf 'notices: vendoring claude-code-proxy crates at %s\n' "$ccp_commit" >&2
+ccp_src="$work/ccp"
+git init --quiet "$ccp_src"
+git -C "$ccp_src" fetch --quiet --depth 1 https://github.com/pierzchalski/claude-code-proxy.git "$ccp_commit"
+git -C "$ccp_src" checkout --quiet FETCH_HEAD
+[[ "$(git -C "$ccp_src" rev-parse HEAD)" == "$ccp_commit" ]] || die "claude-code-proxy commit verification failed"
+[[ "$(sha256sum "$ccp_src/Cargo.lock" | awk '{print $1}')" == "$ccp_lock_sha256" ]] ||
+  die "claude-code-proxy Cargo.lock verification failed"
+printf '\n[workspace]\n' >>"$ccp_src/Cargo.toml"
+ccp_dest="$staging/licenses/claude-code-proxy"
+mkdir -p "$ccp_dest/claude-code-proxy-$ccp_version"
+for file in "$ccp_src"/*; do
+  is_licence_path "${file##*/}" && install -m 0644 "$file" "$ccp_dest/claude-code-proxy-$ccp_version/"
+done
+printf 'claude-code-proxy\tclaude-code-proxy-%s\t%s\tMIT\thttps://github.com/pierzchalski/claude-code-proxy\t%s\n' \
+  "$ccp_version" "$ccp_version" "$(find "$ccp_dest/claude-code-proxy-$ccp_version" -type f | wc -l)" >>"$notes"
+(
+  cd "$ccp_src"
+  CARGO_HOME="$work/cargo-home" cargo vendor --locked --versioned-dirs --quiet "$work/vendor" >/dev/null
+  CARGO_HOME="$work/cargo-home" cargo metadata --locked --offline --format-version 1 \
+    --config "source.crates-io.replace-with='vendored'" \
+    --config "source.vendored.directory='$work/vendor'" >"$work/ccp-metadata.json"
+)
+crate_files=0
+crates_readme_only=0
+: >"$work/crates-without-files"
+: >"$work/crate-files.tsv"
+for crate_dir in "$work/vendor"/*/; do
+  crate="$(basename -- "$crate_dir")"
+  copy_licence_files "$crate_dir" "$ccp_dest/crates/$crate"
+  crate_files=$((crate_files + COPIED))
+  crates_readme_only=$((crates_readme_only + README_ONLY))
+  [[ "$COPIED" -gt 0 ]] || printf '%s\n' "$crate" >>"$work/crates-without-files"
+  if [[ "$COPIED" -eq 0 ]]; then
+    crate_note=none
+  elif [[ "$README_ONLY" -eq 1 ]]; then
+    crate_note="README only"
+  else
+    crate_note=$COPIED
+  fi
+  printf '%s\t%s\n' "$crate" "$crate_note" >>"$work/crate-files.tsv"
+done
+# Crate name, version and licence expression from cargo metadata, one per line.
+grep -o '"name":"[^"]*","version":"[^"]*","id":"[^"]*","license":[^,]*' "$work/ccp-metadata.json" |
+  sed -E 's/^"name":"([^"]*)","version":"([^"]*)","id":"[^"]*","license":(null|"([^"]*)")$/\1\t\2\t\4/' |
+  sort -u >"$work/crates.tsv"
+crate_count="$(wc -l <"$work/crates.tsv")"
+[[ "$crate_count" -gt 0 ]] || die "cargo metadata listed no crates"
+{
+  printf '# claude-code-proxy crates\n\n'
+  printf 'Every crate in Cargo.lock at %s (all platforms, so this over-covers\n' "$ccp_commit"
+  printf 'what is linked), with its declared licence. Licence files the crate ships are in\n'
+  printf '`crates/<name>-<version>/`.\n\n'
+  printf '| crate | version | licence | licence files |\n| --- | --- | --- | --- |\n'
+  awk -F'\t' 'NR == FNR { files[$1] = $2; next }
+    { key = $1 "-" $2
+      printf "| %s | %s | %s | %s |\n", $1, $2, ($3 == "" ? "(none declared)" : $3), \
+        (key in files ? files[key] : "not vendored") }' "$work/crate-files.tsv" "$work/crates.tsv"
+} >"$ccp_dest/CRATES.md"
+printf 'claude-code-proxy\tcrates (%d)\t-\tsee CRATES.md\t-\t%s (%d crates ship no licence file, %d only a README; see CRATES.md)\n' \
+  "$crate_count" "$crate_files" "$(wc -l <"$work/crates-without-files")" "$crates_readme_only" >>"$notes"
+rust_docs="$rust_toolchain/share/doc/rust"
+mkdir -p "$ccp_dest/rust-std"
+cp -RL --no-preserve=mode "$rust_docs/COPYRIGHT-library.html" "$rust_docs/licenses" "$ccp_dest/rust-std/"
+chmod -R u=rwX,go=rX "$ccp_dest/rust-std"
+printf 'claude-code-proxy\trust-std\t%s\tMIT OR Apache-2.0\thttps://www.rust-lang.org\t%s\n' \
+  "$(rustc --version | awk '{print $2}')" "$(find "$ccp_dest/rust-std" -type f | wc -l)" >>"$notes"
+
+# --- Upstream release binaries --------------------------------------------
+# tool, version (must match rebuild), url, sha256, destination file name.
+# atuin's licence comes from the release archive rebuild installs from;
+# the others ship no licence in the release, so it comes from the tag.
+upstream_pins="$work/upstream.tsv"
+cat >"$upstream_pins" <<'EOF_PINS'
+atuin	18.21.0	https://github.com/atuinsh/atuin/releases/download/v18.21.0/atuin-x86_64-unknown-linux-musl.tar.gz	792e1867d113ba9bebec94996b3160164aba738e3d23987b3cddb9dee976ac08	archive
+pandoc	3.10.2	https://raw.githubusercontent.com/jgm/pandoc/3.10.2/COPYING.md	3ebfbf9235b049d384cdba5a66a1a3434bb544391e720b76faa8e1b3ee61a4e5	COPYING.md
+pandoc	3.10.2	https://raw.githubusercontent.com/jgm/pandoc/3.10.2/COPYRIGHT	842e33ef01625e93f85bebb8bac83aa570186b7aa77a09971257cc29f8f60740	COPYRIGHT
+rclone	1.74.2	https://raw.githubusercontent.com/rclone/rclone/v1.74.2/COPYING	8cd2e9e750b90a04b7d82dbbca3930c696ae0309d7c10464f90a44f45754cd04	COPYING
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSE	01aacaeaa55c6d58fe8e78f1bc9904397e3428e9a381b8ca7e3352f85d52c2c7	LICENSE
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/0BSD.txt	e3f18c71e10d673590eb9856c1d79dd3b4b0d65404efb5e8584dbede7edd608b	LICENSES/0BSD.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/Apache-2.0.txt	074e6e32c86a4c0ef8b3ed25b721ca23aca83df277cd88106ef7177c354615ff	LICENSES/Apache-2.0.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/BSD-3-Clause.txt	5a93d5831e1297ab10fe643e1a631e83be392896da14ee2951285a79012df69d	LICENSES/BSD-3-Clause.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/BSL-1.0.txt	84c6ef3ea9e3254a54d0acf5d3e0c61ae011b8fef7dd6940591cf060e6380a8f	LICENSES/BSL-1.0.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/CC0-1.0.txt	a2010f343487d3f7618affe54f789f5487602331c0a8d03f49e9a7c547cf0499	LICENSES/CC0-1.0.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/GPL-2.0-only.txt	aaf135472f81c5b4a0dca9367e5bb5e9750032b5bebe5442b36e4c0a47430df3	LICENSES/GPL-2.0-only.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/GPL-3.0-or-later.txt	fb981668c18a279e285fc4d83fba1e836cc84dd4daa73c9697d3cfd2d8aca6e0	LICENSES/GPL-3.0-or-later.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/MIT.txt	b05785f9f18e6716bab63424b11454513b9943a222595b70411009202fc592b5	LICENSES/MIT.txt
+dwarfs	0.15.3	https://raw.githubusercontent.com/mhx/dwarfs/v0.15.3/LICENSES/Unlicense.txt	0bdebfeda07d45dada625ae1317c6f833186e798b171d0db640bcf32e92a8240	LICENSES/Unlicense.txt
+EOF_PINS
+declare -A upstream_licence=(
+  [atuin]=MIT
+  [pandoc]=GPL-2.0-or-later
+  [rclone]=MIT
+  [dwarfs]="GPL-3.0-or-later AND MIT"
+)
+declare -A upstream_home=(
+  [atuin]=https://atuin.sh
+  [pandoc]=https://github.com/jgm/pandoc
+  [rclone]=https://rclone.org
+  [dwarfs]=https://github.com/mhx/dwarfs
+)
+i=0
+while IFS=$'\t' read -r tool version url sha256 name; do
+  [[ "$(rebuild_value "$tool" version)" == "$version" ]] ||
+    die "$tool is $(rebuild_value "$tool" version) in rebuild but $version in notices; update the pin table"
+  dest="$staging/licenses/$tool/$tool-$version"
+  mkdir -p "$dest"
+  i=$((i + 1))
+  if [[ "$name" == archive ]]; then
+    fetch_pinned "$url" "$sha256" "$work/upstream.$i"
+    copy_licence_files "$work/upstream.$i" "$dest"
+  else
+    mkdir -p "$(dirname -- "$dest/$name")"
+    fetch_pinned "$url" "$sha256" "$dest/$name"
+    chmod 0644 "$dest/$name"
+  fi
+done <"$upstream_pins"
+for tool in atuin pandoc rclone dwarfs; do
+  version="$(rebuild_value "$tool" version)"
+  printf '%s\t%s-%s\t%s\t%s\t%s\t%s\n' "$tool" "$tool" "$version" "$version" "${upstream_licence[$tool]}" \
+    "${upstream_home[$tool]}" "$(find "$staging/licenses/$tool" -type f | wc -l)" >>"$notes"
+done
+
+# --- THIRD_PARTY_NOTICES.md ------------------------------------------------
+# Binary -> tool; the tool's own component is the first row of its section.
+binaries_of() {
+  case "$1" in
+    bwrap) echo bwrap ;;
+    iproute2) echo 'ip, ss' ;;
+    iptables) echo 'xtables-nft-multi (iptables, iptables-save)' ;;
+    nix) echo nix-static ;;
+    dwarfs) echo 'dwarfs-universal (dwarfs, dwarfsck, dwarfsextract, mkdwarfs)' ;;
+    passt) echo 'passt (pasta)' ;;
+    *) echo "$1" ;;
+  esac
+}
+own_component() {
+  case "$1" in
+    bwrap) echo bubblewrap ;;
+    iproute2) echo iproute2 ;;
+    nix) echo nix ;;
+    *) echo "$1" ;;
+  esac
+}
+tools=(atuin bwrap caddy claude-code-proxy dwarfs fuse-overlayfs iproute2 iptables nix pandoc passt rclone socat sops)
+{
+  printf '# Third-party notices\n\n'
+  printf 'The static-bins release binaries are built from the projects below. Each\n'
+  printf 'binary is distributed under its own licence; the licence texts of the tool\n'
+  printf 'and of the libraries linked into it are in `licenses/<tool>/`, one directory\n'
+  printf 'per component, copied from the exact pinned source that was built. The build\n'
+  printf 'scripts in this repository are MIT-licensed (`LICENSE`).\n\n'
+  printf '| binary | tool | version | licence (SPDX) | upstream | licence files |\n'
+  printf '| --- | --- | --- | --- | --- | --- |\n'
+  for tool in "${tools[@]}"; do
+    own="$(own_component "$tool")"
+    awk -F'\t' -v tool="$tool" -v own="$own" -v bins="$(binaries_of "$tool")" '
+      $1 == tool && $2 == own "-" $3 && !done {
+        printf "| %s | %s | %s | %s | %s | `licenses/%s/` |\n", bins, own, $3, $4, $5, tool; done = 1
+      }' "$notes"
+  done
+  printf '\nThe libraries each Nix-built binary may link are taken from the build inputs\n'
+  printf 'of its static derivation, recursively, plus musl, the GCC runtime\n'
+  printf '(libgcc, libstdc++) and, for Go tools, the Go toolchain and the vendored Go\n'
+  printf 'modules (`go-modules/`). This over-approximates what is linked. "files" is the\n'
+  printf 'number of licence files found in that component'"'"'s source.\n'
+  for tool in "${tools[@]}"; do
+    printf '\n## %s\n\n' "$tool"
+    printf '| component | version | licence (SPDX, from nixpkgs or upstream) | homepage | files |\n'
+    printf '| --- | --- | --- | --- | --- |\n'
+    awk -F'\t' -v tool="$tool" '$1 == tool {
+      printf "| %s | %s | %s | %s | %s |\n", $2, $3, $4, ($5 == "" ? "-" : $5), $6
+    }' "$notes"
+    case "$tool" in
+      atuin)
+        printf '\natuin is a Rust program; its crate dependencies are not collected here. See\n'
+        printf 'its `Cargo.lock` at https://github.com/atuinsh/atuin/tree/v%s.\n' "$(rebuild_value atuin version)" ;;
+      pandoc)
+        printf '\npandoc'"'"'s static binary links Haskell libraries and C libraries chosen by\n'
+        printf 'its upstream release build; they are not collected here. `COPYRIGHT` lists\n'
+        printf 'the bundled code upstream documents; see also\n'
+        printf 'https://github.com/jgm/pandoc/tree/%s.\n' "$(rebuild_value pandoc version)" ;;
+      rclone)
+        printf '\nrclone'"'"'s Go module dependencies are not collected here. See `go.mod` at\n'
+        printf 'https://github.com/rclone/rclone/tree/v%s.\n' "$(rebuild_value rclone version)" ;;
+      dwarfs)
+        printf '\nThe universal binary bundles C++ libraries chosen by its upstream build;\n'
+        printf 'upstream'"'"'s `LICENSES/` directory (copied here) holds their licence texts, and\n'
+        printf 'https://github.com/mhx/dwarfs/tree/v%s documents which code uses which.\n' "$(rebuild_value dwarfs version)" ;;
+      claude-code-proxy)
+        printf '\n`CRATES.md` lists every crate in its `Cargo.lock` with its declared licence;\n'
+        printf 'licence files shipped by the crates are in `crates/`. `rust-std/` holds the\n'
+        printf 'Rust standard library'"'"'s licences from the pinned toolchain.\n' ;;
+    esac
+  done
+} >"$staging/THIRD_PARTY_NOTICES.md"
+
+for tool in "${tools[@]}"; do
+  [[ -d "$staging/licenses/$tool" ]] || die "no licence directory for $tool"
+  [[ -n "$(find "$staging/licenses/$tool" -type f -print -quit)" ]] || die "no licence files for $tool"
+done
+
+mv -T -- "$staging" "$out"
+printf 'notices: wrote %s (%s files)\n' "$out" "$(find "$out" -type f | wc -l)" >&2

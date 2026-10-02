@@ -9,26 +9,31 @@ SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" &>/dev/null && pwd -P)"
 
 usage() {
   cat <<'EOF_USAGE'
-Usage: package --system SYS [--root DIR] --out DIR
+Usage: package --system SYS [--root DIR] [--notices DIR] --out DIR
 
 Writes the release assets for one system into --out:
   <tool>-<system>             one per regular file in bin/
   SHA256SUMS-<system>         the bundle manifest (paths are bin/<tool>)
   BUILDINFO-<system>          build provenance
-  static-bins-<system>.tar.gz bin/ (with alias symlinks), SHA256SUMS, BUILDINFO
+  static-bins-<system>.tar.gz bin/ (with alias symlinks), SHA256SUMS,
+                              BUILDINFO, THIRD_PARTY_NOTICES.md, licenses/
+  licenses.tar.gz             THIRD_PARTY_NOTICES.md and licenses/ (the same
+                              for every system)
 
 Options:
-  --system SYS  x86_64-linux or aarch64-linux.
-  --root DIR    Bundle root holding <system>/ (default: <repo>/out).
-  --out DIR     Output directory; created if missing.
-  -h, --help    Show this help.
+  --system SYS   x86_64-linux or aarch64-linux.
+  --root DIR     Bundle root holding <system>/ (default: <repo>/out).
+  --notices DIR  Output of ./notices (default: <root>/notices).
+  --out DIR      Output directory; created if missing.
+  -h, --help     Show this help.
 
-Run verify first; this script only re-checks the manifest.
+Run verify and notices first; this script only re-checks the manifest.
 EOF_USAGE
 }
 
 system=
 root="$SCRIPT_DIR/out"
+notices=
 out=
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -44,6 +49,11 @@ while [[ $# -gt 0 ]]; do
     --root)
       [[ $# -ge 2 ]] || { usage >&2; exit 2; }
       root=$2
+      shift 2
+      ;;
+    --notices)
+      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
+      notices=$2
       shift 2
       ;;
     --out)
@@ -65,6 +75,11 @@ if [[ -z "$system" || -z "$out" ]]; then
 fi
 
 bundle="$root/$system"
+notices=${notices:-$root/notices}
+[[ -f "$notices/THIRD_PARTY_NOTICES.md" && -d "$notices/licenses" ]] || {
+  printf 'package: %s lacks THIRD_PARTY_NOTICES.md or licenses/; run ./notices first\n' "$notices" >&2
+  exit 1
+}
 (cd "$bundle" && sha256sum --check --strict --quiet SHA256SUMS)
 mkdir -p "$out"
 
@@ -74,9 +89,17 @@ done <"$bundle/SHA256SUMS"
 install -m 0644 "$bundle/SHA256SUMS" "$out/SHA256SUMS-$system"
 install -m 0644 "$bundle/BUILDINFO" "$out/BUILDINFO-$system"
 
-# Normalised metadata so the tarball depends only on the bundle contents.
-tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
-  -C "$bundle" -cf - bin SHA256SUMS BUILDINFO \
+# Normalised metadata so the tarballs depend only on their contents. The
+# notices sit beside bin/, never in it: consumers treat bin/ as exactly the
+# manifest files plus aliases.
+tar_normalised() {
+  tar --sort=name --owner=0 --group=0 --numeric-owner --mtime=@0 \
+    --mode=u+rwX,go=rX "$@"
+}
+tar_normalised -cf - -C "$bundle" bin SHA256SUMS BUILDINFO \
+  -C "$notices" THIRD_PARTY_NOTICES.md licenses \
   | gzip -9n >"$out/static-bins-$system.tar.gz"
+tar_normalised -cf - -C "$notices" THIRD_PARTY_NOTICES.md licenses \
+  | gzip -9n >"$out/licenses.tar.gz"
 
 printf 'package: wrote %s assets to %s\n' "$system" "$out"

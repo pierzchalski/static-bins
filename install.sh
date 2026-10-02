@@ -161,14 +161,15 @@ case "$mode" in
     ;;
   tarball)
     fetch "static-bins-$system.tar.gz" "$work/bundle.tar.gz"
-    # Only a flat bin/ directory and the two manifests are acceptable, so no
-    # member can be written through a symlink or outside the work directory.
+    # Accept a flat bin/ directory, the two manifests, and the licence notices
+    # beside them. Only bin/ is extracted, so no member can be written
+    # through a symlink or outside the work directory.
     while IFS= read -r member; do
-      [[ "$member" =~ ^(bin/|bin/[A-Za-z0-9_+-][A-Za-z0-9._+-]*|SHA256SUMS|BUILDINFO)$ ]] \
+      [[ "$member" =~ ^(bin/|bin/[A-Za-z0-9_+-][A-Za-z0-9._+-]*|SHA256SUMS|BUILDINFO|THIRD_PARTY_NOTICES[.]md|licenses/.*)$ ]] \
         || die "unexpected tarball member: $member"
     done < <(tar -tzf "$work/bundle.tar.gz")
     mkdir "$work/extract"
-    tar -xzf "$work/bundle.tar.gz" -C "$work/extract" --no-same-owner --no-same-permissions
+    tar -xzf "$work/bundle.tar.gz" -C "$work/extract" --no-same-owner --no-same-permissions bin
     for name in "${names[@]}"; do
       path="$work/extract/bin/$name"
       [[ -f "$path" && ! -L "$path" ]] || die "tarball lacks regular file bin/$name"
