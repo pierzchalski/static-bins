@@ -2,8 +2,8 @@
 """Run a built claude-code-proxy against a stub Codex backend.
 
 The fork's Codex provider accepts an empty completion as end_turn when the
-request's tail is a successful tool_result (with hook output after it) and the
-completion was empty twice in a row. This drives the binary over HTTP to check
+request's tail is a successful tool_result (optionally followed by hook output)
+and the completion was empty twice in a row. This drives the binary over HTTP to check
 that it still does, for a buffered and a streamed request.
 """
 
@@ -25,8 +25,8 @@ USAGE_DESCRIPTION = """\
 Start BINARY (claude-code-proxy) with an isolated HOME and config dir, point
 its Codex provider at a local stub that answers every /responses request with
 a completed response that has no output, and send /v1/messages requests whose
-tail is user[tool_result] followed by a system-role text message (the shape
-Claude Code sends after a hook adds output to a tool result). For a buffered
+tail is user[tool_result, text] followed by a system-role text message (the
+two places Claude Code puts hook output after a tool result). For a buffered
 and a streamed request, check that the proxy retries the first empty once,
 answers the second with stop_reason end_turn, and logs
 codex_empty_completion_accepted. Uses CCP_CODEX_TRANSPORT=http. Exits 0 when
@@ -39,6 +39,8 @@ EMPTY_COMPLETION_SSE = (
     b'"usage":{"input_tokens":5,"output_tokens":0}}}\n\n'
 )
 
+ARM_MARKERS = ("verify-arm-buffered", "verify-arm-streamed")
+
 REQUEST_TIMEOUT_SECONDS = 60
 STARTUP_TIMEOUT_SECONDS = 30
 
@@ -48,8 +50,12 @@ class StubCodexBackend(http.server.ThreadingHTTPServer):
 
     def __init__(self):
         super().__init__(("127.0.0.1", 0), StubCodexHandler)
-        self.responses_posts = 0
+        self.responses_posts = {}
         self.lock = threading.Lock()
+
+    def posts_for(self, marker):
+        with self.lock:
+            return self.responses_posts.get(marker, 0)
 
     @property
     def responses_url(self):
@@ -66,12 +72,17 @@ class StubCodexHandler(http.server.BaseHTTPRequestHandler):
 
     def do_POST(self):
         length = int(self.headers.get("content-length") or 0)
-        self.rfile.read(length)
+        body = self.rfile.read(length).decode("utf-8", "replace")
         if not self.path.split("?", 1)[0].endswith("/responses"):
             self.send_error(404)
             return
+        # Count per arm, so retries still in flight from a failed arm do not
+        # land in the next arm's count.
+        marker = next((m for m in ARM_MARKERS if m in body), None)
         with self.server.lock:
-            self.server.responses_posts += 1
+            self.server.responses_posts[marker] = (
+                self.server.responses_posts.get(marker, 0) + 1
+            )
         self.send_response(200)
         self.send_header("content-type", "text/event-stream")
         self.send_header("content-length", str(len(EMPTY_COMPLETION_SSE)))
@@ -84,13 +95,13 @@ class StubCodexHandler(http.server.BaseHTTPRequestHandler):
         self.send_error(404)
 
 
-def tool_result_then_system_tail(stream):
+def tool_result_then_system_tail(stream, marker):
     return {
         "model": "gpt-5.5",
         "max_tokens": 64,
         "stream": stream,
         "messages": [
-            {"role": "user", "content": "Hand the result back."},
+            {"role": "user", "content": f"Hand the result back ({marker})."},
             {
                 "role": "assistant",
                 "content": [
@@ -109,7 +120,8 @@ def tool_result_then_system_tail(stream):
                         "type": "tool_result",
                         "tool_use_id": "toolu_verify",
                         "content": "delivered",
-                    }
+                    },
+                    {"type": "text", "text": "PostToolUse hook output."},
                 ],
             },
             {
@@ -138,7 +150,7 @@ def wait_for_proxy(port, proxy):
             connection.close()
             if status == 200:
                 return None
-        except OSError:
+        except (OSError, http.client.HTTPException):
             pass
         time.sleep(0.2)
     return f"proxy did not answer /healthz within {STARTUP_TIMEOUT_SECONDS}s"
@@ -194,6 +206,19 @@ def accepted_log_events(log_path):
     return events
 
 
+def stop_process_group(process):
+    for sig, timeout in ((signal.SIGTERM, 10), (signal.SIGKILL, None)):
+        try:
+            os.killpg(process.pid, sig)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=timeout)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+
+
 def run_checks(binary, scratch):
     home = os.path.join(scratch, "home")
     config_dir = os.path.join(scratch, "config")
@@ -233,36 +258,41 @@ def run_checks(binary, scratch):
         "NO_PROXY": "127.0.0.1,localhost",
     }
     failures = []
-    with open(stderr_path, "w") as stderr:
-        proxy = subprocess.Popen(
-            [binary, "serve", "--no-monitor"],
-            env=environment,
-            stdin=subprocess.DEVNULL,
-            stdout=stderr,
-            stderr=stderr,
-            start_new_session=True,
-        )
+    proxy = None
     try:
-        startup_error = wait_for_proxy(port, proxy)
+        with open(stderr_path, "w") as stderr:
+            try:
+                proxy = subprocess.Popen(
+                    [binary, "serve", "--no-monitor"],
+                    env=environment,
+                    stdin=subprocess.DEVNULL,
+                    stdout=stderr,
+                    stderr=stderr,
+                    start_new_session=True,
+                )
+            except OSError as error:
+                failures.append(f"could not start {binary}: {error}")
+        startup_error = proxy and wait_for_proxy(port, proxy)
         if startup_error:
             failures.append(startup_error)
-        else:
-            for stream in (False, True):
-                label = "streamed" if stream else "buffered"
-                posts_before = stub.responses_posts
-                accepted_before = len(accepted_log_events(log_path))
+        elif proxy:
+            # (stream, label, transport field of the proxy's accept log line)
+            for stream, label, transport in (
+                (False, "buffered", "buffered"),
+                (True, "streamed", "live"),
+            ):
+                marker = f"verify-arm-{label}"
                 try:
                     status, payload = post_messages(
-                        port, tool_result_then_system_tail(stream)
+                        port, tool_result_then_system_tail(stream, marker)
                     )
-                except OSError as error:
-                    attempts = stub.responses_posts - posts_before
+                except (OSError, http.client.HTTPException) as error:
                     failures.append(
-                        f"{label}: request failed after {attempts} upstream attempts: "
-                        f"{error}"
+                        f"{label}: request failed after {stub.posts_for(marker)} "
+                        f"upstream attempts: {error!r}"
                     )
                     continue
-                attempts = stub.responses_posts - posts_before
+                attempts = stub.posts_for(marker)
                 if status != 200:
                     failures.append(
                         f"{label}: HTTP {status} after {attempts} upstream attempts: "
@@ -291,30 +321,21 @@ def run_checks(binary, scratch):
                         f"{label}: {attempts} upstream /responses attempts, expected 2 "
                         "(the first empty retried once, the second accepted)"
                     )
-                # The proxy writes the log line before it answers, but give a
-                # buffered writer a moment rather than racing it.
-                deadline = time.monotonic() + 5
-                while (
-                    len(accepted_log_events(log_path)) <= accepted_before
-                    and time.monotonic() < deadline
-                ):
-                    time.sleep(0.1)
-                new_events = accepted_log_events(log_path)[accepted_before:]
-                if len(new_events) != 1:
+                # The proxy appends each log line with its own write, before
+                # the buffered answer and while the streamed one is in flight.
+                events = [
+                    event
+                    for event in accepted_log_events(log_path)
+                    if event.get("fields", {}).get("transport") == transport
+                ]
+                if len(events) != 1:
                     failures.append(
-                        f"{label}: {len(new_events)} codex_empty_completion_accepted "
-                        f"lines in {log_path}, expected 1"
+                        f"{label}: {len(events)} codex_empty_completion_accepted "
+                        f'lines with transport "{transport}" in {log_path}, expected 1'
                     )
     finally:
-        try:
-            os.killpg(proxy.pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        try:
-            proxy.wait(timeout=10)
-        except subprocess.TimeoutExpired:
-            os.killpg(proxy.pid, signal.SIGKILL)
-            proxy.wait()
+        if proxy is not None:
+            stop_process_group(proxy)
         stub.shutdown()
         stub.server_close()
 
@@ -352,6 +373,9 @@ def main():
         help="keep the scratch directory (config, logs) and print its path",
     )
     args = parser.parse_args()
+    # A SIGTERM (timeout, a cancelled CI job) must still stop the proxy, which
+    # runs in its own session: raise SystemExit so the finally blocks run.
+    signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(1))
     if not (os.path.isfile(args.binary) and os.access(args.binary, os.X_OK)):
         print(f"verify-claude-code-proxy: not an executable file: {args.binary}",
               file=sys.stderr)
