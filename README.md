@@ -127,7 +127,10 @@ fetches the pinned sources and copies their licence files; see
 - **claude-code-proxy**: tag the new commit in the fork
   (`eap/v<upstream>-<topic>`; never move a tag), then update `version`,
   `commit` and `lock_sha256` (the sha256 of its `Cargo.lock`) in
-  `build_claude_code_proxy`.
+  `build_claude_code_proxy`. `verify` runs `verify-claude-code-proxy` on
+  the native binary: against a stub Codex backend, it checks that an empty
+  completion after a successful `tool_result` is retried once and then
+  answered as `end_turn` (pierzchalski/tickets#919). It needs `python3`.
 - **Nix-built tools**: they follow `nixpkgs-unstable` in `flake.nix`. Change
   the pinned revision there and run `nix flake update nixpkgs-unstable`; this
   moves every Nix-built tool at once.

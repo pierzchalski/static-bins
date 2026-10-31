@@ -1,0 +1,372 @@
+#!/usr/bin/env python3
+"""Run a built claude-code-proxy against a stub Codex backend.
+
+The fork's Codex provider accepts an empty completion as end_turn when the
+request's tail is a successful tool_result (with hook output after it) and the
+completion was empty twice in a row. This drives the binary over HTTP to check
+that it still does, for a buffered and a streamed request.
+"""
+
+import argparse
+import http.client
+import http.server
+import json
+import os
+import shutil
+import signal
+import socket
+import subprocess
+import sys
+import tempfile
+import threading
+import time
+
+USAGE_DESCRIPTION = """\
+Start BINARY (claude-code-proxy) with an isolated HOME and config dir, point
+its Codex provider at a local stub that answers every /responses request with
+a completed response that has no output, and send /v1/messages requests whose
+tail is user[tool_result] followed by a system-role text message (the shape
+Claude Code sends after a hook adds output to a tool result). For a buffered
+and a streamed request, check that the proxy retries the first empty once,
+answers the second with stop_reason end_turn, and logs
+codex_empty_completion_accepted. Uses CCP_CODEX_TRANSPORT=http. Exits 0 when
+every check passes, 1 when one fails, 2 on a usage error.
+"""
+
+EMPTY_COMPLETION_SSE = (
+    b'data: {"type":"response.completed","response":{"id":"resp_empty",'
+    b'"status":"completed","incomplete_details":null,'
+    b'"usage":{"input_tokens":5,"output_tokens":0}}}\n\n'
+)
+
+REQUEST_TIMEOUT_SECONDS = 60
+STARTUP_TIMEOUT_SECONDS = 30
+
+
+class StubCodexBackend(http.server.ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self):
+        super().__init__(("127.0.0.1", 0), StubCodexHandler)
+        self.responses_posts = 0
+        self.lock = threading.Lock()
+
+    @property
+    def responses_url(self):
+        # CCP_CODEX_BASE_URL is the full /responses URL; the proxy derives
+        # /models from it.
+        return f"http://127.0.0.1:{self.server_address[1]}/backend-api/codex/responses"
+
+
+class StubCodexHandler(http.server.BaseHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def log_message(self, format, *args):
+        pass
+
+    def do_POST(self):
+        length = int(self.headers.get("content-length") or 0)
+        self.rfile.read(length)
+        if not self.path.split("?", 1)[0].endswith("/responses"):
+            self.send_error(404)
+            return
+        with self.server.lock:
+            self.server.responses_posts += 1
+        self.send_response(200)
+        self.send_header("content-type", "text/event-stream")
+        self.send_header("content-length", str(len(EMPTY_COMPLETION_SSE)))
+        self.end_headers()
+        self.wfile.write(EMPTY_COMPLETION_SSE)
+
+    def do_GET(self):
+        # The proxy's background model-catalog refresh asks for /models; a 404
+        # leaves it on its built-in model list.
+        self.send_error(404)
+
+
+def tool_result_then_system_tail(stream):
+    return {
+        "model": "gpt-5.5",
+        "max_tokens": 64,
+        "stream": stream,
+        "messages": [
+            {"role": "user", "content": "Hand the result back."},
+            {
+                "role": "assistant",
+                "content": [
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_verify",
+                        "name": "SubagentHandback",
+                        "input": {"message": "done"},
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "toolu_verify",
+                        "content": "delivered",
+                    }
+                ],
+            },
+            {
+                "role": "system",
+                "content": [{"type": "text", "text": "Stop hook output."}],
+            },
+        ],
+    }
+
+
+def free_port():
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+        sock.bind(("127.0.0.1", 0))
+        return sock.getsockname()[1]
+
+
+def wait_for_proxy(port, proxy):
+    deadline = time.monotonic() + STARTUP_TIMEOUT_SECONDS
+    while time.monotonic() < deadline:
+        if proxy.poll() is not None:
+            return f"proxy exited with status {proxy.returncode} before it was ready"
+        try:
+            connection = http.client.HTTPConnection("127.0.0.1", port, timeout=2)
+            connection.request("GET", "/healthz")
+            status = connection.getresponse().status
+            connection.close()
+            if status == 200:
+                return None
+        except OSError:
+            pass
+        time.sleep(0.2)
+    return f"proxy did not answer /healthz within {STARTUP_TIMEOUT_SECONDS}s"
+
+
+def post_messages(port, body):
+    connection = http.client.HTTPConnection(
+        "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
+    )
+    connection.request(
+        "POST",
+        "/v1/messages",
+        body=json.dumps(body),
+        headers={
+            "content-type": "application/json",
+            "anthropic-version": "2023-06-01",
+            "x-claude-code-session-id": "static-bins-verify",
+        },
+    )
+    response = connection.getresponse()
+    payload = response.read().decode("utf-8", "replace")
+    connection.close()
+    return response.status, payload
+
+
+def streamed_stop_reasons(payload):
+    reasons = []
+    for line in payload.splitlines():
+        if not line.startswith("data:"):
+            continue
+        try:
+            event = json.loads(line[len("data:"):].strip())
+        except json.JSONDecodeError:
+            continue
+        if event.get("type") == "message_delta":
+            reasons.append(event.get("delta", {}).get("stop_reason"))
+    return reasons
+
+
+def accepted_log_events(log_path):
+    events = []
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as log:
+            for line in log:
+                if "codex_empty_completion_accepted" not in line:
+                    continue
+                try:
+                    events.append(json.loads(line))
+                except json.JSONDecodeError:
+                    events.append({"raw": line.rstrip("\n")})
+    except FileNotFoundError:
+        pass
+    return events
+
+
+def run_checks(binary, scratch):
+    home = os.path.join(scratch, "home")
+    config_dir = os.path.join(scratch, "config")
+    state_home = os.path.join(scratch, "state")
+    os.makedirs(home)
+    os.makedirs(os.path.join(config_dir, "codex"))
+    os.makedirs(state_home)
+    with open(os.path.join(config_dir, "codex", "auth.json"), "w") as auth:
+        json.dump(
+            {
+                "access": "verify-access",
+                "refresh": "verify-refresh",
+                "expires": 4102444800000,
+                "account_id": "acct_verify",
+            },
+            auth,
+        )
+    log_path = os.path.join(state_home, "claude-code-proxy", "proxy.log")
+    stderr_path = os.path.join(scratch, "proxy.stderr")
+
+    stub = StubCodexBackend()
+    threading.Thread(target=stub.serve_forever, daemon=True).start()
+
+    port = free_port()
+    environment = {
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+        "HOME": home,
+        "XDG_CONFIG_HOME": os.path.join(scratch, "xdg-config"),
+        "XDG_STATE_HOME": state_home,
+        "XDG_CACHE_HOME": os.path.join(scratch, "cache"),
+        "TMPDIR": scratch,
+        "CCP_CONFIG_DIR": config_dir,
+        "CCP_BIND_ADDRESS": "127.0.0.1",
+        "PORT": str(port),
+        "CCP_CODEX_BASE_URL": stub.responses_url,
+        "CCP_CODEX_TRANSPORT": "http",
+        "NO_PROXY": "127.0.0.1,localhost",
+    }
+    failures = []
+    with open(stderr_path, "w") as stderr:
+        proxy = subprocess.Popen(
+            [binary, "serve", "--no-monitor"],
+            env=environment,
+            stdin=subprocess.DEVNULL,
+            stdout=stderr,
+            stderr=stderr,
+            start_new_session=True,
+        )
+    try:
+        startup_error = wait_for_proxy(port, proxy)
+        if startup_error:
+            failures.append(startup_error)
+        else:
+            for stream in (False, True):
+                label = "streamed" if stream else "buffered"
+                posts_before = stub.responses_posts
+                accepted_before = len(accepted_log_events(log_path))
+                try:
+                    status, payload = post_messages(
+                        port, tool_result_then_system_tail(stream)
+                    )
+                except OSError as error:
+                    attempts = stub.responses_posts - posts_before
+                    failures.append(
+                        f"{label}: request failed after {attempts} upstream attempts: "
+                        f"{error}"
+                    )
+                    continue
+                attempts = stub.responses_posts - posts_before
+                if status != 200:
+                    failures.append(
+                        f"{label}: HTTP {status} after {attempts} upstream attempts: "
+                        f"{payload[:500]}"
+                    )
+                    continue
+                if stream:
+                    reasons = streamed_stop_reasons(payload)
+                    if reasons != ["end_turn"]:
+                        failures.append(
+                            f"{label}: message_delta stop_reasons {reasons}, "
+                            "expected ['end_turn']"
+                        )
+                else:
+                    try:
+                        stop_reason = json.loads(payload).get("stop_reason")
+                    except json.JSONDecodeError:
+                        stop_reason = None
+                    if stop_reason != "end_turn":
+                        failures.append(
+                            f"{label}: stop_reason {stop_reason!r}, expected 'end_turn': "
+                            f"{payload[:500]}"
+                        )
+                if attempts != 2:
+                    failures.append(
+                        f"{label}: {attempts} upstream /responses attempts, expected 2 "
+                        "(the first empty retried once, the second accepted)"
+                    )
+                # The proxy writes the log line before it answers, but give a
+                # buffered writer a moment rather than racing it.
+                deadline = time.monotonic() + 5
+                while (
+                    len(accepted_log_events(log_path)) <= accepted_before
+                    and time.monotonic() < deadline
+                ):
+                    time.sleep(0.1)
+                new_events = accepted_log_events(log_path)[accepted_before:]
+                if len(new_events) != 1:
+                    failures.append(
+                        f"{label}: {len(new_events)} codex_empty_completion_accepted "
+                        f"lines in {log_path}, expected 1"
+                    )
+    finally:
+        try:
+            os.killpg(proxy.pid, signal.SIGTERM)
+        except ProcessLookupError:
+            pass
+        try:
+            proxy.wait(timeout=10)
+        except subprocess.TimeoutExpired:
+            os.killpg(proxy.pid, signal.SIGKILL)
+            proxy.wait()
+        stub.shutdown()
+        stub.server_close()
+
+    if failures:
+        for failure in failures:
+            print(f"verify-claude-code-proxy: {failure}", file=sys.stderr)
+        for title, path in (("proxy output", stderr_path), ("proxy log", log_path)):
+            try:
+                with open(path, encoding="utf-8", errors="replace") as source:
+                    tail = source.readlines()[-40:]
+            except FileNotFoundError:
+                tail = ["(missing)\n"]
+            print(f"--- {title} ({path}), last lines:", file=sys.stderr)
+            sys.stderr.writelines(tail)
+        return 1
+    print("verify-claude-code-proxy: empty completion after a tool_result tail "
+          "accepted as end_turn (buffered and streamed)")
+    return 0
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        prog="verify-claude-code-proxy",
+        description=USAGE_DESCRIPTION,
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    parser.add_argument(
+        "--binary",
+        required=True,
+        help="claude-code-proxy executable to run (it must run on this host)",
+    )
+    parser.add_argument(
+        "--keep-scratch",
+        action="store_true",
+        help="keep the scratch directory (config, logs) and print its path",
+    )
+    args = parser.parse_args()
+    if not (os.path.isfile(args.binary) and os.access(args.binary, os.X_OK)):
+        print(f"verify-claude-code-proxy: not an executable file: {args.binary}",
+              file=sys.stderr)
+        return 2
+    binary = os.path.abspath(args.binary)
+    scratch = tempfile.mkdtemp(prefix="verify-claude-code-proxy.")
+    try:
+        return run_checks(binary, scratch)
+    finally:
+        if args.keep_scratch:
+            print(f"verify-claude-code-proxy: scratch kept at {scratch}",
+                  file=sys.stderr)
+        else:
+            shutil.rmtree(scratch, ignore_errors=True)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

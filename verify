@@ -16,7 +16,8 @@ Usage: verify [--system x86_64-linux|aarch64-linux|all] [--root DIR]
 Checks a bundle at DIR/<system>/ (DIR defaults to <repo>/out): BUILDINFO
 provenance against this checkout, file-set parity, checksums, ELF
 architecture/static linkage, and alias containment. Runtime smoke tests run
-for the native architecture.
+for the native architecture; they include verify-claude-code-proxy, which
+needs python3.
 
 Options:
   --system SYS       System to check (default: all).
@@ -228,6 +229,7 @@ verify_system() {
 
   if [[ "$system" == "$native_system" && $structural_only -ne 1 ]]; then
     "$bin_dir/claude-code-proxy" --version >/dev/null
+    "$SCRIPT_DIR/verify-claude-code-proxy" --binary "$bin_dir/claude-code-proxy"
     "$bin_dir/bwrap" --version >/dev/null
     "$bin_dir/fuse-overlayfs" --version >/dev/null
     "$bin_dir/passt" --version >/dev/null
