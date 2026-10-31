@@ -156,7 +156,7 @@ def wait_for_proxy(port, proxy):
     return f"proxy did not answer /healthz within {STARTUP_TIMEOUT_SECONDS}s"
 
 
-def post_messages(port, body):
+def post_messages(port, body, session):
     connection = http.client.HTTPConnection(
         "127.0.0.1", port, timeout=REQUEST_TIMEOUT_SECONDS
     )
@@ -167,7 +167,7 @@ def post_messages(port, body):
         headers={
             "content-type": "application/json",
             "anthropic-version": "2023-06-01",
-            "x-claude-code-session-id": "static-bins-verify",
+            "x-claude-code-session-id": session,
         },
     )
     response = connection.getresponse()
@@ -284,7 +284,9 @@ def run_checks(binary, scratch):
                 marker = f"verify-arm-{label}"
                 try:
                     status, payload = post_messages(
-                        port, tool_result_then_system_tail(stream, marker)
+                        port,
+                        tool_result_then_system_tail(stream, marker),
+                        f"static-bins-{marker}",
                     )
                 except (OSError, http.client.HTTPException) as error:
                     failures.append(

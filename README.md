@@ -91,8 +91,9 @@ diff x/SHA256SUMS pinned/SHA256SUMS-x86_64-linux
 
 ## Building locally
 
-Requires Nix with flakes, and `python3` on the host for `verify`'s native
-runtime smoke test (`verify-claude-code-proxy`). Everything else, including
+Requires Nix with flakes, and `python3` on the host for the native runtime
+smoke test (`verify-claude-code-proxy`) that `verify`, and so `rebuild`, runs.
+Everything else, including
 both musl cross toolchains, comes from `flake.nix`.
 
 ```sh
