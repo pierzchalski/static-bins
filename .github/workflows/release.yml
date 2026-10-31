@@ -33,6 +33,7 @@ jobs:
         run: |
           ./rebuild --help >/dev/null
           ./verify --help >/dev/null
+          ./verify-claude-code-proxy --help >/dev/null
           ./resolve-system --help >/dev/null
           ./install.sh --help >/dev/null
       - name: Build bwrap (x86_64-linux, partial)
